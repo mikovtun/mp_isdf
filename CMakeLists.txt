@@ -43,6 +43,10 @@ endif()
 
 FetchContent_MakeAvailable(blaspp lapackpp)
 
+# SLATE enables its test suite by default when embedded as a dependency;
+# those tests require source-tree-only headers and are not needed here.
+set(build_tests OFF CACHE BOOL "Build SLATE tests" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "Disable dependency test suites" FORCE)
 FetchContent_Declare(
     slate
     GIT_REPOSITORY https://github.com/icl-utk-edu/slate.git
