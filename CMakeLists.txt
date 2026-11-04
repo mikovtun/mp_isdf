@@ -81,10 +81,59 @@ endif()
 
 if(ISDF_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    find_package(LAPACK REQUIRED)
+
+    # MAGMA uses CMAKE_SOURCE_DIR internally, so it must be configured as a
+    # standalone project rather than added with FetchContent_MakeAvailable.
+    include(ExternalProject)
+    # MAGMA's Git checkout omits generated precision sources and CMake.src.cuda.
+    # Its Makefile generates both before the standalone CMake configure step.
+    find_program(ISDF_MAKE_EXECUTABLE NAMES gmake make REQUIRED)
+    set(ISDF_MAGMA_GENERATE_ARCH sm_80)
+    if(CMAKE_CUDA_ARCHITECTURES)
+        list(GET CMAKE_CUDA_ARCHITECTURES 0 ISDF_MAGMA_FIRST_ARCH)
+        if(ISDF_MAGMA_FIRST_ARCH MATCHES "^([0-9]+)")
+            set(ISDF_MAGMA_GENERATE_ARCH "sm_${CMAKE_MATCH_1}")
+        endif()
+    endif()
+    set(ISDF_MAGMA_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/magma-src")
+    set(ISDF_MAGMA_BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/magma-build")
+    set(ISDF_MAGMA_LIBRARY "${ISDF_MAGMA_BINARY_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}magma${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    file(MAKE_DIRECTORY "${ISDF_MAGMA_SOURCE_DIR}/include" "${ISDF_MAGMA_BINARY_DIR}/include")
+    ExternalProject_Add(magma_external
+        GIT_REPOSITORY https://github.com/icl-utk-edu/magma.git
+        GIT_TAG v2.10.0
+        GIT_SHALLOW TRUE
+        SOURCE_DIR "${ISDF_MAGMA_SOURCE_DIR}"
+        BINARY_DIR "${ISDF_MAGMA_BINARY_DIR}"
+        PATCH_COMMAND ${ISDF_MAKE_EXECUTABLE} -C <SOURCE_DIR> generate
+            FORT=true BACKEND=cuda GPU_TARGET=${ISDF_MAGMA_GENERATE_ARCH}
+        CMAKE_ARGS
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DMAGMA_ENABLE_CUDA=ON
+            -DMAGMA_ENABLE_HIP=OFF
+            -DUSE_FORTRAN=OFF
+            -DBUILD_SHARED_LIBS=OFF
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target magma
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS "${ISDF_MAGMA_LIBRARY}"
+    )
+    add_library(isdf_magma STATIC IMPORTED GLOBAL)
+    set_target_properties(isdf_magma PROPERTIES
+        IMPORTED_LOCATION "${ISDF_MAGMA_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${ISDF_MAGMA_SOURCE_DIR}/include;${ISDF_MAGMA_BINARY_DIR}/include"
+    )
+    add_dependencies(isdf_magma magma_external)
+    target_link_libraries(isdf_magma INTERFACE
+        ${LAPACK_LIBRARIES} CUDA::cudart CUDA::cublas CUDA::cusparse)
+    if(ISDF_ENABLE_OPENMP)
+        target_link_libraries(isdf_magma INTERFACE OpenMP::OpenMP_CXX)
+    endif()
 endif()
 
-add_executable(isdf_slate src/main.cpp)
-target_include_directories(isdf_slate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_executable(isdf_slate cpp/src/main.cpp)
+target_include_directories(isdf_slate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
 
 # SLATE package exports the `slate` target in current releases; accept the
 # namespaced target as well for packages that provide it.
@@ -117,6 +166,6 @@ if(ISDF_ENABLE_MPI)
 endif()
 
 if(ISDF_ENABLE_CUDA)
-    target_link_libraries(isdf_slate PRIVATE CUDA::cudart)
+    target_link_libraries(isdf_slate PRIVATE CUDA::cudart isdf_magma)
     target_compile_definitions(isdf_slate PRIVATE ISDF_ENABLE_CUDA=1)
 endif()
