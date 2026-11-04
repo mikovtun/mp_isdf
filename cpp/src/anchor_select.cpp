@@ -28,6 +28,7 @@ void check_product_size(std::size_t nfeatures, std::size_t npoints)
     }
 }
 
+#ifndef ISDF_ENABLE_CUDA
 std::vector<std::int64_t> qrcp_cpu(std::vector<double>& matrix,
                                    std::size_t m, std::size_t n)
 {
@@ -39,9 +40,10 @@ std::vector<std::int64_t> qrcp_cpu(std::vector<double>& matrix,
     }
     return jpvt; // LAPACK uses 1-based pivot indices.
 }
+#endif
 
 #ifdef ISDF_ENABLE_CUDA
-std::vector<std::int64_t> qrcp_magma(std::vector<double>& matrix,
+std::vector<std::int64_t> qrcp_magma(double* device_matrix,
                                      std::size_t m, std::size_t n)
 {
     if (m > static_cast<std::size_t>(std::numeric_limits<magma_int_t>::max()) ||
@@ -54,19 +56,35 @@ std::vector<std::int64_t> qrcp_magma(std::vector<double>& matrix,
     const auto cols = static_cast<magma_int_t>(n);
     std::vector<magma_int_t> pivots(n, 0);
     std::vector<double> tau(std::min(m, n));
-    double query = 0.0;
-    magma_int_t info = 0;
-    magma_dgeqp3(rows, cols, matrix.data(), rows, pivots.data(), tau.data(),
-                 &query, -1, &info);
-    if (info != 0 || !std::isfinite(query) || query < 1 ||
-        query > static_cast<double>(std::numeric_limits<magma_int_t>::max())) {
-        throw std::runtime_error("MAGMA geqp3 workspace query failed");
+    magma_device_t device;
+    magma_getdevice(&device);
+    magma_queue_t queue;
+    magma_queue_create(device, &queue);
+    struct DestroyQueue {
+        magma_queue_t queue;
+        ~DestroyQueue() { magma_queue_destroy(queue); }
+    } destroy_queue{queue};
+
+    magma_int_t host_bytes = -1, device_bytes = -1, info = 0;
+    magma_dgeqp3_expert_gpu_work(rows, cols, nullptr, rows, nullptr, nullptr,
+                                  nullptr, &host_bytes, nullptr, &device_bytes, &info, queue);
+    if (info != 0 || host_bytes < 0 || device_bytes <= 0) {
+        throw std::runtime_error("MAGMA geqp3 GPU workspace query failed");
     }
-    const auto lwork = static_cast<magma_int_t>(std::ceil(query));
-    std::vector<double> work(lwork);
-    magma_dgeqp3(rows, cols, matrix.data(), rows, pivots.data(), tau.data(),
-                 work.data(), lwork, &info);
-    if (info != 0) throw std::runtime_error("MAGMA geqp3 failed: " + std::to_string(info));
+    void* workspace = nullptr;
+    if (magma_malloc(&workspace, static_cast<std::size_t>(device_bytes)) != MAGMA_SUCCESS) {
+        throw std::runtime_error("MAGMA geqp3 GPU workspace allocation failed");
+    }
+    struct FreeWorkspace {
+        void* ptr;
+        ~FreeWorkspace() { magma_free(ptr); }
+    } free_workspace{workspace};
+    // The expert API's lengths are bytes; unlike magma_dgeqp3_gpu its host
+    // length must be reset to zero after querying, or it queries again.
+    magma_dgeqp3_expert_gpu_work(rows, cols, device_matrix, rows, pivots.data(), tau.data(),
+                                  nullptr, &host_bytes, workspace, &device_bytes, &info, queue);
+    magma_queue_sync(queue);
+    if (info != 0) throw std::runtime_error("MAGMA geqp3 GPU failed: " + std::to_string(info));
     return {pivots.begin(), pivots.end()}; // MAGMA also uses 1-based indices.
 }
 #endif
@@ -172,7 +190,13 @@ std::vector<std::size_t> AnchorSelection::select(
     // A = weighted product^T; columns of A correspond to grid points.
     // Kokkos writes columns contiguously so LAPACK/MAGMA can consume them.
     const std::size_t m = nfeatures * nfeatures;
+#ifdef ISDF_ENABLE_CUDA
+    // The MAGMA input must be in CUDA memory even when another Kokkos backend
+    // happens to be the default execution space.
+    using Device = Kokkos::Cuda;
+#else
     using Device = Kokkos::DefaultExecutionSpace;
+#endif
     Kokkos::View<double*, Device> d_features("axis_features", features.size());
     Kokkos::View<double*, Device> d_weights("grid_weights", ng);
     Kokkos::View<double*, Device> d_product("pair_product_transpose", ng * m);
@@ -189,28 +213,38 @@ std::vector<std::size_t> AnchorSelection::select(
         d_product(index) = d_weights(g) * d_features(g*nfeatures + pair/nfeatures) *
                            d_features(g*nfeatures + pair%nfeatures);
     });
-    auto h_product = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d_product);
-    std::vector<double> matrix(ng * m);
-    for (std::size_t i = 0; i < matrix.size(); ++i) {
-        if (!std::isfinite(h_product(i))) throw std::overflow_error("non-finite weighted pair product");
-        matrix[i] = h_product(i);
-    }
+    int nonfinite = 0;
+    Kokkos::parallel_reduce("isdf_check_pair_product", Kokkos::RangePolicy<Device>(0, ng*m),
+                            KOKKOS_LAMBDA(const std::size_t i, int& bad) {
+        if (!Kokkos::isfinite(d_product(i))) ++bad;
+    }, nonfinite);
+    if (nonfinite) throw std::overflow_error("non-finite weighted pair product");
 
+    const auto cap = std::min({m, ng, max_rank ? max_rank : std::min(m, ng)});
+    std::vector<double> diagonal(cap);
     std::vector<std::int64_t> jpvt;
 #ifdef ISDF_ENABLE_CUDA
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0) {
-        jpvt = qrcp_magma(matrix, m, ng);
-    } else
+    // MAGMA uses its own stream; finish the Kokkos product kernel before QR.
+    Kokkos::fence();
+    jpvt = qrcp_magma(d_product.data(), m, ng);
+    Kokkos::View<double*, Device> d_diagonal("qr_diagonal", cap);
+    Kokkos::parallel_for("isdf_qr_diagonal", Kokkos::RangePolicy<Device>(0, cap),
+                         KOKKOS_LAMBDA(const std::size_t i) {
+        d_diagonal(i) = d_product(i*m + i);
+    });
+    auto h_diagonal = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d_diagonal);
+    for (std::size_t i = 0; i < cap; ++i) diagonal[i] = h_diagonal(i);
+#else
+    auto h_product = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d_product);
+    std::vector<double> matrix(ng * m);
+    for (std::size_t i = 0; i < matrix.size(); ++i) matrix[i] = h_product(i);
+    jpvt = qrcp_cpu(matrix, m, ng);
+    for (std::size_t i = 0; i < cap; ++i) diagonal[i] = matrix[i*m + i];
 #endif
-    {
-        jpvt = qrcp_cpu(matrix, m, ng);
-    }
-    const auto cap = std::min({m, ng, max_rank ? max_rank : std::min(m, ng)});
-    const double first = cap ? std::abs(matrix[0]) : 0.0;
+    const double first = cap ? std::abs(diagonal[0]) : 0.0;
     std::vector<std::size_t> selected;
     for (std::size_t i = 0; i < cap; ++i) {
-        if (first == 0 || std::abs(matrix[i*m + i]) <= tolerance * first) break;
+        if (first == 0 || std::abs(diagonal[i]) <= tolerance * first) break;
         const auto pivot = jpvt[i];
         if (pivot < 1 || static_cast<std::size_t>(pivot) > ng) {
             throw std::runtime_error("QRCP returned an invalid grid pivot");
