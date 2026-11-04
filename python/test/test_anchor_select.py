@@ -1,4 +1,4 @@
-"""Tests for local ISDF anchor selection. Build: cmake --build build --target isdf_ao."""
+"""Tests for local ISDF anchor selection. Build: cmake --build build --target mp_isdf_python."""
 
 from pathlib import Path
 import gc
@@ -10,7 +10,7 @@ from scipy.linalg import qr
 from pyscf import gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "build"))
-import isdf_ao
+import mp_isdf
 
 
 class TestAnchorSelection(unittest.TestCase):
@@ -18,8 +18,8 @@ class TestAnchorSelection(unittest.TestCase):
     def setUpClass(cls):
         cls.mol = gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)
         cls.mean_field = scf.RHF(cls.mol).run(verbose=0)
-        cls.context = isdf_ao.LibcintContext(cls.mol._atm, cls.mol._bas, cls.mol._env)
-        cls.selector = isdf_ao.AnchorSelection(cls.context)
+        cls.context = mp_isdf.LibcintContext(cls.mol._atm, cls.mol._bas, cls.mol._env)
+        cls.selector = mp_isdf.AnchorSelection(cls.context)
         cls.points = np.random.default_rng(12).normal(size=(8, 3))
         cls.weights = np.array([1., 2., 0., -1., 1., 3., 1., 1.])
 
@@ -32,11 +32,11 @@ class TestAnchorSelection(unittest.TestCase):
         nocc = self.mol.nelectron // 2
         c = self.mean_field.mo_coeff
         pieces = {
-            isdf_ao.AxisType.AtomicOrbital: ao,
-            isdf_ao.AxisType.AtomicOrbitalGradX: gradient[0],
-            isdf_ao.AxisType.AtomicOrbitalGradY: gradient[1],
-            isdf_ao.AxisType.AtomicOrbitalGradZ: gradient[2],
-            isdf_ao.AxisType.OccupiedOrbital: ao @ c[:, :nocc],
+            mp_isdf.AxisType.AtomicOrbital: ao,
+            mp_isdf.AxisType.AtomicOrbitalGradX: gradient[0],
+            mp_isdf.AxisType.AtomicOrbitalGradY: gradient[1],
+            mp_isdf.AxisType.AtomicOrbitalGradZ: gradient[2],
+            mp_isdf.AxisType.OccupiedOrbital: ao @ c[:, :nocc],
         }
         columns = np.hstack([pieces[axis] for axis in axes])
         outer = (columns[:, :, None] * columns[:, None, :]).reshape(len(points), -1)
@@ -56,23 +56,23 @@ class TestAnchorSelection(unittest.TestCase):
         self.assertNotIn(2, actual)  # Original index of the removed zero-weight point.
 
     def test_ao_and_gradient(self):
-        self.check_reference([isdf_ao.AxisType.AtomicOrbital])
-        self.check_reference([isdf_ao.AxisType.AtomicOrbitalGradX,
-                              isdf_ao.AxisType.AtomicOrbitalGradZ], max_rank=4)
+        self.check_reference([mp_isdf.AxisType.AtomicOrbital])
+        self.check_reference([mp_isdf.AxisType.AtomicOrbitalGradX,
+                              mp_isdf.AxisType.AtomicOrbitalGradZ], max_rank=4)
 
     def test_axis_concatenation_with_repeated_types(self):
-        self.check_reference([isdf_ao.AxisType.AtomicOrbitalGradZ,
-                              isdf_ao.AxisType.AtomicOrbital,
-                              isdf_ao.AxisType.AtomicOrbitalGradZ], max_rank=3)
+        self.check_reference([mp_isdf.AxisType.AtomicOrbitalGradZ,
+                              mp_isdf.AxisType.AtomicOrbital,
+                              mp_isdf.AxisType.AtomicOrbitalGradZ], max_rank=3)
 
     def test_selection_runtime_dispatch(self):
-        axes = [isdf_ao.AxisType.AtomicOrbital,
-                isdf_ao.AxisType.AtomicOrbitalGradX]
-        spaces = ("host", "auto", "device") if isdf_ao.cuda_enabled else ("host", "auto")
+        axes = [mp_isdf.AxisType.AtomicOrbital,
+                mp_isdf.AxisType.AtomicOrbitalGradX]
+        spaces = ("host", "auto", "device") if mp_isdf.cuda_enabled else ("host", "auto")
         for space in spaces:
             with self.subTest(space=space):
                 self.check_reference(axes, max_rank=3, space=space)
-        if not isdf_ao.cuda_enabled:
+        if not mp_isdf.cuda_enabled:
             with self.assertRaises(ValueError):
                 self.selector.select(self.points, self.weights, axes, space="device")
         self.assertEqual(self.selector.select(self.points, np.zeros(8), axes,
@@ -83,10 +83,10 @@ class TestAnchorSelection(unittest.TestCase):
     def test_axis_evaluation_on_host(self):
         # Exercises the host AO/gradient kernels, MO projection, and axis
         # assembly—not just compilation of the host-space template.
-        axes = [isdf_ao.AxisType.AtomicOrbitalGradZ,
-                isdf_ao.AxisType.OccupiedOrbital,
-                isdf_ao.AxisType.AtomicOrbital,
-                isdf_ao.AxisType.AtomicOrbitalGradZ]
+        axes = [mp_isdf.AxisType.AtomicOrbitalGradZ,
+                mp_isdf.AxisType.OccupiedOrbital,
+                mp_isdf.AxisType.AtomicOrbital,
+                mp_isdf.AxisType.AtomicOrbitalGradZ]
         c = self.mean_field.mo_coeff
         nocc = self.mol.nelectron // 2
         ao = self.mol.eval_gto("GTOval_sph", self.points)
@@ -96,35 +96,35 @@ class TestAnchorSelection(unittest.TestCase):
                                            nocc=nocc, space="host")
         default = self.selector.evaluate_axis(self.points, axes, mo_coeff=c,
                                               nocc=nocc, space="auto")
-        if isdf_ao.cuda_enabled:
+        if mp_isdf.cuda_enabled:
             device = self.selector.evaluate_axis(self.points, axes, mo_coeff=c,
                                                  nocc=nocc, space="device")
         np.testing.assert_allclose(host, expected, rtol=1e-11, atol=1e-12)
         np.testing.assert_allclose(host, default, rtol=1e-11, atol=1e-12)
-        if isdf_ao.cuda_enabled:
+        if mp_isdf.cuda_enabled:
             np.testing.assert_allclose(host, device, rtol=1e-11, atol=1e-12)
 
     def test_occupied_rhf(self):
-        self.check_reference([isdf_ao.AxisType.OccupiedOrbital], occupied=True)
-        self.check_reference([isdf_ao.AxisType.OccupiedOrbital,
-                              isdf_ao.AxisType.AtomicOrbitalGradY], occupied=True)
+        self.check_reference([mp_isdf.AxisType.OccupiedOrbital], occupied=True)
+        self.check_reference([mp_isdf.AxisType.OccupiedOrbital,
+                              mp_isdf.AxisType.AtomicOrbitalGradY], occupied=True)
 
     def test_single_axis_and_all_zero_weights(self):
-        axis = isdf_ao.AxisType.AtomicOrbital
+        axis = mp_isdf.AxisType.AtomicOrbital
         selected = self.selector.select(self.points, self.weights, axis, max_rank=1)
         self.assertEqual(len(selected), 1)
         self.assertEqual(self.selector.select(self.points, np.zeros(8), axis), [])
 
     def test_selector_keeps_context_alive(self):
-        temporary = isdf_ao.LibcintContext(self.mol._atm, self.mol._bas, self.mol._env)
-        selector = isdf_ao.AnchorSelection(temporary)
+        temporary = mp_isdf.LibcintContext(self.mol._atm, self.mol._bas, self.mol._env)
+        selector = mp_isdf.AnchorSelection(temporary)
         del temporary
         gc.collect()
         self.assertTrue(selector.select(self.points, self.weights,
-                                        isdf_ao.AxisType.AtomicOrbital))
+                                        mp_isdf.AxisType.AtomicOrbital))
 
     def test_invalid_and_unimplemented(self):
-        axis = isdf_ao.AxisType.OccupiedOrbital
+        axis = mp_isdf.AxisType.OccupiedOrbital
         with self.assertRaises(ValueError):
             self.selector.select(self.points, self.weights, axis)
         with self.assertRaises(ValueError):
@@ -134,11 +134,11 @@ class TestAnchorSelection(unittest.TestCase):
                                  mo_coeff=np.ones((2, 1)), nocc=1)
         with self.assertRaises(RuntimeError):
             self.selector.select(self.points, self.weights,
-                                 isdf_ao.AxisType.AtomicOrbital,
-                                 algorithm=isdf_ao.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting)
-        distributed = isdf_ao.DistributedAnchorSelection(self.context)
+                                 mp_isdf.AxisType.AtomicOrbital,
+                                 algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting)
+        distributed = mp_isdf.DistributedAnchorSelection(self.context)
         with self.assertRaises(RuntimeError):
-            distributed.select(self.points, self.weights, isdf_ao.AxisType.AtomicOrbital)
+            distributed.select(self.points, self.weights, mp_isdf.AxisType.AtomicOrbital)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(isdf_slate LANGUAGES CXX)
+project(mp_isdf LANGUAGES CXX)
 
 option(ISDF_ENABLE_MPI "Enable MPI support" ON)
 option(ISDF_ENABLE_CUDA "Enable CUDA support" ON)
@@ -140,15 +140,15 @@ if(ISDF_ENABLE_CUDA)
     endif()
 endif()
 
-add_executable(isdf_slate cpp/src/main.cpp)
-target_include_directories(isdf_slate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+add_executable(mp_isdf cpp/src/main.cpp)
+target_include_directories(mp_isdf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
 
 # SLATE package exports the `slate` target in current releases; accept the
 # namespaced target as well for packages that provide it.
 if(TARGET SLATE::slate)
-    set(ISDF_SLATE_TARGET SLATE::slate)
+    set(SLATE_LIBRARY_TARGET SLATE::slate)
 elseif(TARGET slate)
-    set(ISDF_SLATE_TARGET slate)
+    set(SLATE_LIBRARY_TARGET slate)
 else()
     message(FATAL_ERROR "SLATE was found, but it did not export SLATE::slate or slate")
 endif()
@@ -161,16 +161,16 @@ else()
     message(FATAL_ERROR "libcint was fetched, but no cint or libcint target was exported")
 endif()
 
-add_library(isdf_ao_core STATIC cpp/src/ao_eval.cpp)
-target_include_directories(isdf_ao_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
-target_link_libraries(isdf_ao_core PUBLIC Kokkos::kokkos ${ISDF_CINT_TARGET})
-set_target_properties(isdf_ao_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(mp_isdf_orbitals STATIC cpp/src/ao_eval.cpp)
+target_include_directories(mp_isdf_orbitals PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+target_link_libraries(mp_isdf_orbitals PUBLIC Kokkos::kokkos ${ISDF_CINT_TARGET})
+set_target_properties(mp_isdf_orbitals PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(isdf_anchor_core STATIC
     cpp/src/anchor_select.cpp
     cpp/src/anchor_select_qrcp.cpp)
 target_include_directories(isdf_anchor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
-target_link_libraries(isdf_anchor_core PUBLIC isdf_ao_core lapackpp)
+target_link_libraries(isdf_anchor_core PUBLIC mp_isdf_orbitals lapackpp)
 set_target_properties(isdf_anchor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(ISDF_ENABLE_CUDA)
     target_link_libraries(isdf_anchor_core PUBLIC isdf_magma CUDA::cudart)
@@ -178,22 +178,25 @@ if(ISDF_ENABLE_CUDA)
 endif()
 
 # pybind11's default LTO can duplicate CUDA fatbinData during device linking.
-pybind11_add_module(isdf_ao NO_EXTRAS cpp/src/ao_eval_pybind.cpp cpp/src/anchor_select_pybind.cpp)
-target_link_libraries(isdf_ao PRIVATE isdf_anchor_core)
+# The extension and executable both use the public name mp_isdf, but CMake
+# targets must be distinct; OUTPUT_NAME sets the Python import name.
+pybind11_add_module(mp_isdf_python NO_EXTRAS cpp/src/ao_eval_pybind.cpp cpp/src/anchor_select_pybind.cpp)
+set_target_properties(mp_isdf_python PROPERTIES OUTPUT_NAME mp_isdf)
+target_link_libraries(mp_isdf_python PRIVATE isdf_anchor_core)
 
-target_link_libraries(isdf_slate PRIVATE
+target_link_libraries(mp_isdf PRIVATE
     Kokkos::kokkos
-    ${ISDF_SLATE_TARGET}
+    ${SLATE_LIBRARY_TARGET}
     ${ISDF_CINT_TARGET}
     pybind11::embed
 )
 
 if(ISDF_ENABLE_MPI)
-    target_link_libraries(isdf_slate PRIVATE MPI::MPI_CXX)
-    target_compile_definitions(isdf_slate PRIVATE ISDF_ENABLE_MPI=1)
+    target_link_libraries(mp_isdf PRIVATE MPI::MPI_CXX)
+    target_compile_definitions(mp_isdf PRIVATE ISDF_ENABLE_MPI=1)
 endif()
 
 if(ISDF_ENABLE_CUDA)
-    target_link_libraries(isdf_slate PRIVATE CUDA::cudart isdf_magma)
-    target_compile_definitions(isdf_slate PRIVATE ISDF_ENABLE_CUDA=1)
+    target_link_libraries(mp_isdf PRIVATE CUDA::cudart isdf_magma)
+    target_compile_definitions(mp_isdf PRIVATE ISDF_ENABLE_CUDA=1)
 endif()

@@ -66,7 +66,7 @@ py::array_t<double> evaluate(const isdf::LibcintContext& context,
 
 void bind_anchor_select(py::module_& m);
 
-PYBIND11_MODULE(isdf_ao, m)
+PYBIND11_MODULE(mp_isdf, m)
 {
     m.doc() = "Kokkos spherical AO values and gradients for libcint/PySCF tables";
 #ifdef KOKKOS_ENABLE_CUDA

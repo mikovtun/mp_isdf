@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Minimal grid ISDF demo adapted from ../isdf/isdf.py.
 
-PySCF builds the molecular grid; isdf_ao evaluates AOs and selects anchors
+PySCF builds the molecular grid; mp_isdf evaluates AOs and selects anchors
 with local QRCP (MAGMA on device, LAPACK++ on host). The remaining ISDF fit
 and spherical-cell Coulomb metric are NumPy reference implementations.
 
-Build first: cmake --build build --target isdf_ao
+Build first: cmake --build build --target mp_isdf_python
 Example: OMP_PROC_BIND=false python python/isdf.py --level 0 --rank 4
 """
 
@@ -18,15 +18,15 @@ import numpy as np
 from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
-import isdf_ao
+import mp_isdf
 
 
 AXES = {
-    "ao": isdf_ao.AxisType.AtomicOrbital,
-    "dx": isdf_ao.AxisType.AtomicOrbitalGradX,
-    "dy": isdf_ao.AxisType.AtomicOrbitalGradY,
-    "dz": isdf_ao.AxisType.AtomicOrbitalGradZ,
-    "occ": isdf_ao.AxisType.OccupiedOrbital,
+    "ao": mp_isdf.AxisType.AtomicOrbital,
+    "dx": mp_isdf.AxisType.AtomicOrbitalGradX,
+    "dy": mp_isdf.AxisType.AtomicOrbitalGradY,
+    "dz": mp_isdf.AxisType.AtomicOrbitalGradZ,
+    "occ": mp_isdf.AxisType.OccupiedOrbital,
 }
 
 
@@ -80,9 +80,9 @@ def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
     if not np.any(keep):
         raise ValueError("grid has no nonzero weights")
 
-    context = isdf_ao.LibcintContext(mol._atm, mol._bas, mol._env)
-    selector = isdf_ao.AnchorSelection(context)
-    needs_occ = isdf_ao.AxisType.OccupiedOrbital in axis_types
+    context = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+    selector = mp_isdf.AnchorSelection(context)
+    needs_occ = mp_isdf.AxisType.OccupiedOrbital in axis_types
     if needs_occ and (mf is None or not isinstance(mf, scf.hf.RHF) or
                       mol.spin != 0 or mf.mo_coeff is None):
         raise ValueError("'occ' requires a converged, closed-shell RHF mean-field object")

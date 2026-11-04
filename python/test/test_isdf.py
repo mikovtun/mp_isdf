@@ -8,7 +8,7 @@ import numpy as np
 from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from isdf import build_isdf, isdf_ao
+from isdf import build_isdf, mp_isdf
 
 
 class TestMinimalISDF(unittest.TestCase):
@@ -21,9 +21,9 @@ class TestMinimalISDF(unittest.TestCase):
         grids = dft.gen_grid.Grids(self.mol)
         grids.level = 0
         grids.build()
-        context = isdf_ao.LibcintContext(self.mol._atm, self.mol._bas, self.mol._env)
-        expected = isdf_ao.AnchorSelection(context).select(
-            grids.coords, grids.weights, isdf_ao.AxisType.AtomicOrbital, max_rank=4
+        context = mp_isdf.LibcintContext(self.mol._atm, self.mol._bas, self.mol._env)
+        expected = mp_isdf.AnchorSelection(context).select(
+            grids.coords, grids.weights, mp_isdf.AxisType.AtomicOrbital, max_rank=4
         )
         np.testing.assert_array_equal(result["anchor_indices"], expected)
         rank = len(expected)
