@@ -177,12 +177,17 @@ if(ISDF_ENABLE_CUDA)
     target_compile_definitions(isdf_anchor_core PRIVATE ISDF_ENABLE_CUDA=1)
 endif()
 
+add_library(isdf_coulomb_core STATIC cpp/src/coulomb_metric.cpp)
+target_include_directories(isdf_coulomb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+target_link_libraries(isdf_coulomb_core PUBLIC mp_isdf_orbitals)
+set_target_properties(isdf_coulomb_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # pybind11's default LTO can duplicate CUDA fatbinData during device linking.
 # The extension and executable both use the public name mp_isdf, but CMake
 # targets must be distinct; OUTPUT_NAME sets the Python import name.
-pybind11_add_module(mp_isdf_python NO_EXTRAS cpp/src/ao_eval_pybind.cpp cpp/src/anchor_select_pybind.cpp)
+pybind11_add_module(mp_isdf_python NO_EXTRAS cpp/src/ao_eval_pybind.cpp cpp/src/anchor_select_pybind.cpp cpp/src/coulomb_metric_pybind.cpp)
 set_target_properties(mp_isdf_python PROPERTIES OUTPUT_NAME mp_isdf)
-target_link_libraries(mp_isdf_python PRIVATE isdf_anchor_core)
+target_link_libraries(mp_isdf_python PRIVATE isdf_anchor_core isdf_coulomb_core)
 
 target_link_libraries(mp_isdf PRIVATE
     Kokkos::kokkos

@@ -65,6 +65,7 @@ py::array_t<double> evaluate(const isdf::LibcintContext& context,
 } // namespace
 
 void bind_anchor_select(py::module_& m);
+void bind_coulomb_metric(py::module_& m);
 
 PYBIND11_MODULE(mp_isdf, m)
 {
@@ -115,4 +116,5 @@ PYBIND11_MODULE(mp_isdf, m)
     }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"),
        py::arg("space") = "auto");
     bind_anchor_select(m);
+    bind_coulomb_metric(m);
 }

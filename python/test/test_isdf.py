@@ -1,6 +1,8 @@
 """Integration tests for the minimal Python ISDF driver."""
 
 from pathlib import Path
+from contextlib import redirect_stdout
+import io
 import sys
 import unittest
 
@@ -17,7 +19,7 @@ class TestMinimalISDF(unittest.TestCase):
         cls.mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
 
     def test_ao_anchor_selection_and_metric(self):
-        result = build_isdf(self.mol, level=0, max_rank=4)
+        result = build_isdf(self.mol, level=0, anchor_rank=4)
         grids = dft.gen_grid.Grids(self.mol)
         grids.level = 0
         grids.build()
@@ -52,16 +54,42 @@ class TestMinimalISDF(unittest.TestCase):
             np.linalg.norm(approx - overlap) / np.linalg.norm(overlap),
         )
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
+        self.assertEqual(list(result["timings"]), [
+            "grid", "context", "anchor_selection", "ao_evaluation",
+            "isdf_fit", "overlap_check", "coulomb_metric",
+        ])
+        self.assertTrue(all(value >= 0 for value in result["timings"].values()))
+        np.testing.assert_allclose(sum(result["timings"].values()), result["elapsed"],
+                                   rtol=1e-12, atol=1e-12)
+
+    def test_timings_are_reported_during_build(self):
+        output = io.StringIO()
+        original = mp_isdf.coulomb_metric
+
+        def check_progress(*args, **kwargs):
+            self.assertIn("overlap_check", output.getvalue())
+            self.assertNotIn("coulomb_metric", output.getvalue())
+            return original(*args, **kwargs)
+
+        from unittest.mock import patch
+        with redirect_stdout(output), patch.object(mp_isdf, "coulomb_metric", check_progress):
+            result = build_isdf(self.mol, level=0, anchor_rank=2,
+                                report_timings=True)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), len(result["timings"]))
+        self.assertIn("grid", lines[0])
+        self.assertIn("coulomb_metric", lines[-1])
 
     def test_host_space_driver(self):
-        result = build_isdf(self.mol, level=0, max_rank=2,
+        result = build_isdf(self.mol, level=0, anchor_rank=2,
                             compute_metric=False, space="host")
         self.assertGreater(len(result["anchor_indices"]), 0)
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
+        self.assertEqual(result["timings"]["coulomb_metric"], 0.0)
 
     def test_occupied_feature_selection(self):
         mf = scf.RHF(self.mol).run(verbose=0)
-        result = build_isdf(self.mol, mf, level=0, max_rank=2,
+        result = build_isdf(self.mol, mf, level=0, anchor_rank=2,
                             axes=("ao", "occ"), compute_metric=False)
         self.assertGreater(len(result["anchor_indices"]), 0)
         self.assertLessEqual(len(result["anchor_indices"]), 2)
