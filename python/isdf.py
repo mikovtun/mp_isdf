@@ -53,6 +53,30 @@ def grid_coulomb_metric(interp_vecs, coords, weights):
     return 0.5 * (metric + metric.T)
 
 
+def evaluate_isdf_jk(result, dm):
+    """Return (J, K) for a real symmetric AO density matrix.
+
+    The metric in `result` already includes both anchor quadrature weights.
+    X[p,mu] = AO_mu(anchor_p), and (mu nu|lambda sigma) is approximated by
+    sum_pq X[p,mu] X[p,nu] Z[p,q] X[q,lambda] X[q,sigma].
+    """
+    x = np.asarray(result["X1"])
+    z = result["coulomb_metric"]
+    if z is None:
+        raise ValueError("a Coulomb metric is required to evaluate J and K")
+    density = np.asarray(dm, dtype=np.float64)
+    if density.shape != (x.shape[1], x.shape[1]) or not np.isfinite(density).all():
+        raise ValueError("dm must be a finite AO density matrix of shape (nao,nao)")
+    if not np.allclose(density, density.T, rtol=1e-12, atol=1e-12):
+        raise ValueError("dm must be symmetric")
+    if np.shape(z) != (len(x), len(x)):
+        raise ValueError("Coulomb metric has the wrong anchor dimensions")
+    projected_density = x @ density @ x.T
+    j = x.T @ ((z @ np.diag(projected_density))[:, None] * x)
+    k = x.T @ (z * projected_density) @ x
+    return 0.5 * (j + j.T), 0.5 * (k + k.T)
+
+
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
@@ -224,6 +248,8 @@ def main():
                         help="maximum ERI Cholesky rank (0: tolerance only; ignored for grid)")
     parser.add_argument("--no-metric", action="store_true",
                         help="skip Coulomb metric regardless of --metric")
+    parser.add_argument("--compare", action="store_true",
+                        help="evaluate ISDF J/K and compare with exact PySCF J/K (can be expensive)")
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
@@ -235,6 +261,8 @@ def main():
         parser.error("--metric-tol must be finite and nonnegative")
     if args.metric_rank < 0:
         parser.error("--metric-rank must be nonnegative")
+    if args.compare and args.no_metric:
+        parser.error("--compare requires a Coulomb metric (omit --no-metric)")
     atom = _read_xyz(args.molecule) if args.molecule else "H 0 0 0; H 0 0 0.74"
     mol = gto.M(atom=atom, basis=args.basis, unit="Angstrom", verbose=0)
     axes = [axis.strip().lower() for axis in args.axes.split(",")]
@@ -258,6 +286,30 @@ def main():
     if result["coulomb_metric"] is not None:
         print("Coulomb metric shape:", result["coulomb_metric"].shape)
     print(f"ISDF build time: {result['elapsed']:.6f} s")
+    if args.compare:
+        started = time.perf_counter()
+        if mf is not None:
+            dm = mf.make_rdm1()
+            density_source = "converged RHF"
+        else:
+            dm = scf.hf.init_guess_by_minao(mol)
+            density_source = "PySCF MINAO initial guess"
+        print(f"  density_matrix       {time.perf_counter() - started:10.6f} s "
+              f"({density_source})", flush=True)
+
+        started = time.perf_counter()
+        j_isdf, k_isdf = evaluate_isdf_jk(result, dm)
+        print(f"  isdf_jk              {time.perf_counter() - started:10.6f} s", flush=True)
+
+        started = time.perf_counter()
+        j_exact, k_exact = scf.hf.get_jk(mol, dm)
+        print(f"  pyscf_jk             {time.perf_counter() - started:10.6f} s", flush=True)
+        for label, approximate, exact in (("J", j_isdf, j_exact),
+                                          ("K", k_isdf, k_exact)):
+            error = np.linalg.norm(approximate - exact)
+            relative = error / max(np.linalg.norm(exact), 1e-30)
+            print(f"{label} ISDF vs PySCF: absolute Frobenius error {error:.3e}; "
+                  f"relative error {relative:.3e}")
 
 
 if __name__ == "__main__":

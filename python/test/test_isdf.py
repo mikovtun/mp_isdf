@@ -10,7 +10,7 @@ import numpy as np
 from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from isdf import build_isdf, grid_coulomb_metric, mp_isdf
+from isdf import build_isdf, evaluate_isdf_jk, grid_coulomb_metric, main, mp_isdf
 
 
 class TestMinimalISDF(unittest.TestCase):
@@ -92,6 +92,42 @@ class TestMinimalISDF(unittest.TestCase):
         np.testing.assert_allclose(result["coulomb_metric"],
                                    weights[:, None] * expected * weights[None, :])
         self.assertGreaterEqual(result["timings"]["coulomb_metric"], 0)
+
+    def test_jk_contractions_and_pyscf_reference(self):
+        result = build_isdf(self.mol, level=0, anchor_rank=3)
+        x, z = result["X1"], result["coulomb_metric"]
+        dm = scf.hf.init_guess_by_minao(self.mol)
+        j, k = evaluate_isdf_jk(result, dm)
+        eri = np.einsum("pu,pv,pq,qw,qx->uvwx", x, x, z, x, x)
+        np.testing.assert_allclose(j, np.einsum("uvwx,wx->uv", eri, dm))
+        np.testing.assert_allclose(k, np.einsum("uwvx,wx->uv", eri, dm))
+        j_ref, k_ref = scf.hf.get_jk(self.mol, dm)
+        exact = self.mol.intor("int2e")
+        np.testing.assert_allclose(j_ref, np.einsum("uvwx,wx->uv", exact, dm))
+        np.testing.assert_allclose(k_ref, np.einsum("uwvx,wx->uv", exact, dm))
+        self.assertTrue(np.isfinite(np.linalg.norm(j - j_ref)))
+        self.assertTrue(np.isfinite(np.linalg.norm(k - k_ref)))
+        with self.assertRaisesRegex(ValueError, "density"):
+            evaluate_isdf_jk(result, np.ones((3, 3)))
+        with self.assertRaisesRegex(ValueError, "symmetric"):
+            evaluate_isdf_jk(result, np.array([[1., 1.], [0., 1.]]))
+        with self.assertRaisesRegex(ValueError, "metric"):
+            evaluate_isdf_jk({**result, "coulomb_metric": None}, dm)
+
+    def test_cli_comparison_is_opt_in(self):
+        from unittest.mock import patch
+        args = ["isdf.py", "--anchor-rank", "2", "--space", "host"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", args), redirect_stdout(output), \
+             patch.object(scf.hf, "get_jk", side_effect=AssertionError(
+                 "exact J/K must not run by default")):
+            main()
+        self.assertNotIn("ISDF vs PySCF", output.getvalue())
+        output = io.StringIO()
+        with patch.object(sys, "argv", args + ["--compare"]), redirect_stdout(output):
+            main()
+        self.assertIn("J ISDF vs PySCF", output.getvalue())
+        self.assertIn("K ISDF vs PySCF", output.getvalue())
 
     def test_host_space_driver(self):
         result = build_isdf(self.mol, level=0, anchor_rank=2,
