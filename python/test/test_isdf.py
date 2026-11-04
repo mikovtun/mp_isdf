@@ -10,7 +10,7 @@ import numpy as np
 from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from isdf import build_isdf, mp_isdf
+from isdf import build_isdf, grid_coulomb_metric, mp_isdf
 
 
 class TestMinimalISDF(unittest.TestCase):
@@ -79,6 +79,19 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertEqual(len(lines), len(result["timings"]))
         self.assertIn("grid", lines[0])
         self.assertIn("coulomb_metric", lines[-1])
+
+    def test_grid_metric_selection(self):
+        from unittest.mock import patch
+        with patch.object(mp_isdf, "coulomb_metric", side_effect=AssertionError(
+                "grid metric must not call libcint Cholesky")):
+            result = build_isdf(self.mol, level=0, anchor_rank=2,
+                                metric_algorithm="grid", metric_rank=1)
+        expected = grid_coulomb_metric(result["interp_vecs"],
+                                       result["coordinates"], result["weights"])
+        weights = result["anchor_weights"]
+        np.testing.assert_allclose(result["coulomb_metric"],
+                                   weights[:, None] * expected * weights[None, :])
+        self.assertGreaterEqual(result["timings"]["coulomb_metric"], 0)
 
     def test_host_space_driver(self):
         result = build_isdf(self.mol, level=0, anchor_rank=2,

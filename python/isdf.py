@@ -64,9 +64,11 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     `anchor_rank=0` leaves rank to the QR diagonal `anchor_tol`. Anchor indices
     are relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
-    The integral-direct metric always runs on the host; `metric_tol` is relative
-    to the largest initial AO-pair ERI diagonal. `report_timings` prints each
-    completed stage immediately; timings are also returned in the result.
+    `metric_algorithm="unblocked_greedy"` uses the host integral-direct
+    Cholesky metric (`metric_tol` is relative to the largest initial ERI
+    diagonal); `"grid"` uses the spherical-cell grid approximation instead.
+    `report_timings` prints each completed stage immediately; timings are
+    also returned in the result.
     """
     started = time.perf_counter()
     last = started
@@ -147,11 +149,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
 
     metric = None
     if compute_metric:
-        metric = mp_isdf.coulomb_metric(
-            context, transform, algorithm=metric_algorithm,
-            tolerance=metric_tol, max_rank=metric_rank,
-            batch_size=metric_batch_size,
-        )
+        if metric_algorithm == "grid":
+            metric = grid_coulomb_metric(interp_vecs, coords, weights)
+        else:
+            metric = mp_isdf.coulomb_metric(
+                context, transform, algorithm=metric_algorithm,
+                tolerance=metric_tol, max_rank=metric_rank,
+                batch_size=metric_batch_size,
+            )
         metric = anchor_weights[:, None] * metric * anchor_weights[None, :]
         record("coulomb_metric")
     else:
@@ -210,12 +215,15 @@ def main():
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
                         help="where AO evaluation and QRCP run")
+    parser.add_argument("--metric", choices=("unblocked_greedy", "grid"),
+                        default="unblocked_greedy",
+                        help="Coulomb metric algorithm (default: unblocked_greedy)")
     parser.add_argument("--metric-tol", type=float, default=1e-12,
-                        help="relative residual-diagonal cutoff for integral-direct Cholesky")
+                        help="relative Cholesky residual cutoff (ignored for --metric grid)")
     parser.add_argument("--metric-rank", type=int, default=0,
-                        help="maximum ERI Cholesky rank (0: tolerance only)")
+                        help="maximum ERI Cholesky rank (0: tolerance only; ignored for grid)")
     parser.add_argument("--no-metric", action="store_true",
-                        help="skip integral-direct Coulomb metric")
+                        help="skip Coulomb metric regardless of --metric")
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
@@ -238,11 +246,11 @@ def main():
     result = build_isdf(mol, mf, level=args.level, anchor_rank=args.anchor_rank,
                         anchor_tol=args.anchor_tol, axes=axes,
                         compute_metric=not args.no_metric, space=args.space,
-                        metric_tol=args.metric_tol, metric_rank=args.metric_rank,
+                        metric_algorithm=args.metric, metric_tol=args.metric_tol,
+                        metric_rank=args.metric_rank,
                         report_timings=True)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
-    print("Original grid anchor indices:", result["anchor_indices"])
     if args.anchor_rank and len(result["anchor_indices"]) == args.anchor_rank:
         print(f"Anchor count equals --anchor-rank {args.anchor_rank}; use --anchor-rank 0 "
               "for tolerance-only selection or a larger value for a higher cap.")
