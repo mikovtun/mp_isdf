@@ -7,6 +7,8 @@ option(ISDF_ENABLE_CUDA "Enable CUDA support" ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Kokkos and libcint are also linked into a Python extension module.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(FetchContent)
 
@@ -152,6 +154,15 @@ elseif(TARGET libcint)
 else()
     message(FATAL_ERROR "libcint was fetched, but no cint or libcint target was exported")
 endif()
+
+add_library(isdf_ao_core STATIC cpp/src/ao_eval.cpp)
+target_include_directories(isdf_ao_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+target_link_libraries(isdf_ao_core PUBLIC Kokkos::kokkos ${ISDF_CINT_TARGET})
+set_target_properties(isdf_ao_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# pybind11's default LTO can duplicate CUDA fatbinData during device linking.
+pybind11_add_module(isdf_ao NO_EXTRAS cpp/src/ao_eval_pybind.cpp)
+target_link_libraries(isdf_ao PRIVATE isdf_ao_core)
 
 target_link_libraries(isdf_slate PRIVATE
     Kokkos::kokkos
