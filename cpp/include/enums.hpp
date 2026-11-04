@@ -1,5 +1,9 @@
 #pragma once
 
+// Select where Kokkos evaluation runs. Auto uses the accelerator when this
+// build enables CUDA, otherwise the host. Device requires a CUDA build.
+enum class EvaluationSpace { Auto, Host, Device };
+
 // Defines function on an axis
 enum class AxisType {
   AtomicOrbital,

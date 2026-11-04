@@ -161,7 +161,8 @@ LibcintContext::~LibcintContext() = default;
 
 std::size_t LibcintContext::nao() const noexcept { return impl_->nao; }
 
-std::vector<double> LibcintContext::evaluate(
+template <class Device>
+Kokkos::View<double*, Device> LibcintContext::evaluate_impl(
     const std::vector<std::array<double, 3>>& points, bool gradient) const
 {
     if (!Kokkos::is_initialized()) {
@@ -173,15 +174,24 @@ std::vector<double> LibcintContext::evaluate(
                 points.size() * nao > std::numeric_limits<std::size_t>::max() / components)) {
         throw std::overflow_error("AO result is too large");
     }
-    std::vector<double> result(components * points.size() * nao);
-    if (points.empty() || nao == 0) return result;
+    Kokkos::View<double*, Device> d_result("ao_result", components * points.size() * nao);
+    if (points.empty() || nao == 0) return d_result;
 
-    using Device = Kokkos::DefaultExecutionSpace;
-    const auto d_shells = impl_->d_shells;
-    const auto d_env = impl_->d_env;
-    const auto d_transforms = impl_->d_transforms;
+    Kokkos::View<Shell*, Device> d_shells;
+    Kokkos::View<double*, Device> d_env, d_transforms;
+    if constexpr (std::is_same_v<Device, Kokkos::DefaultExecutionSpace>) {
+        d_shells = impl_->d_shells;
+        d_env = impl_->d_env;
+        d_transforms = impl_->d_transforms;
+    } else {
+        d_shells = decltype(d_shells)("ao_shells_on_host", impl_->d_shells.size());
+        d_env = decltype(d_env)("ao_env_on_host", impl_->d_env.size());
+        d_transforms = decltype(d_transforms)("ao_transforms_on_host", impl_->d_transforms.size());
+        Kokkos::deep_copy(d_shells, impl_->d_shells);
+        Kokkos::deep_copy(d_env, impl_->d_env);
+        Kokkos::deep_copy(d_transforms, impl_->d_transforms);
+    }
     Kokkos::View<double*[3], Device> d_points("ao_points", points.size());
-    Kokkos::View<double*, Device> d_result("ao_result", result.size());
     auto h_points = Kokkos::create_mirror_view(d_points);
     for (std::size_t i = 0; i < points.size(); ++i) {
         for (int k = 0; k < 3; ++k) h_points(i, k) = points[i][k];
@@ -238,38 +248,84 @@ std::vector<double> LibcintContext::evaluate(
             }
         }
     });
-    auto h_result = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d_result);
-    for (std::size_t i = 0; i < result.size(); ++i) result[i] = h_result(i);
-    return result;
+    return d_result;
+}
+
+Kokkos::View<double*, Kokkos::DefaultExecutionSpace> LibcintContext::evaluate_default_view(
+    const std::vector<std::array<double, 3>>& points, bool gradient) const
+{
+    return evaluate_impl<Kokkos::DefaultExecutionSpace>(points, gradient);
+}
+
+Kokkos::View<double*, Kokkos::DefaultHostExecutionSpace> LibcintContext::evaluate_host_view(
+    const std::vector<std::array<double, 3>>& points, bool gradient) const
+{
+    return evaluate_impl<Kokkos::DefaultHostExecutionSpace>(points, gradient);
+}
+
+#ifdef KOKKOS_ENABLE_CUDA
+Kokkos::View<double*, Kokkos::Cuda> LibcintContext::evaluate_cuda_view(
+    const std::vector<std::array<double, 3>>& points, bool gradient) const
+{
+    return evaluate_impl<Kokkos::Cuda>(points, gradient);
+}
+#endif
+
+std::vector<double> LibcintContext::evaluate(
+    const std::vector<std::array<double, 3>>& points, bool gradient,
+    EvaluationSpace space) const
+{
+    auto to_host = [](const auto& values) {
+        auto mirror = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, values);
+        std::vector<double> result(values.size());
+        for (std::size_t i = 0; i < result.size(); ++i) result[i] = mirror(i);
+        return result;
+    };
+    switch (space) {
+    case EvaluationSpace::Host:
+        return to_host(evaluate_host_view(points, gradient));
+    case EvaluationSpace::Auto:
+#ifdef KOKKOS_ENABLE_CUDA
+    case EvaluationSpace::Device:
+        return to_host(evaluate_cuda_view(points, gradient));
+#else
+        return to_host(evaluate_host_view(points, gradient));
+    case EvaluationSpace::Device:
+        throw std::invalid_argument("device evaluation requires a CUDA build");
+#endif
+    }
+    throw std::invalid_argument("unknown evaluation space");
 }
 
 std::vector<double> LibcintContext::eval_ao(
-    const std::vector<std::array<double, 3>>& points) const
+    const std::vector<std::array<double, 3>>& points, EvaluationSpace space) const
 {
-    return evaluate(points, false);
+    return evaluate(points, false, space);
 }
 
 std::vector<double> LibcintContext::eval_ao_gradient(
-    const std::vector<std::array<double, 3>>& points) const
+    const std::vector<std::array<double, 3>>& points, EvaluationSpace space) const
 {
-    return evaluate(points, true);
+    return evaluate(points, true, space);
 }
 
 std::vector<double> eval_ao(const std::vector<FINT>& atm,
                             const std::vector<FINT>& bas,
                             const std::vector<double>& env,
-                            const std::vector<std::array<double, 3>>& points)
+                            const std::vector<std::array<double, 3>>& points,
+                            EvaluationSpace space)
 {
-    return LibcintContext(atm, bas, env).eval_ao(points);
+    return LibcintContext(atm, bas, env).eval_ao(points, space);
 }
 
 std::vector<double> eval_ao_gradient(
     const std::vector<FINT>& atm,
     const std::vector<FINT>& bas,
     const std::vector<double>& env,
-    const std::vector<std::array<double, 3>>& points)
+    const std::vector<std::array<double, 3>>& points,
+    EvaluationSpace space)
 {
-    return LibcintContext(atm, bas, env).eval_ao_gradient(points);
+    return LibcintContext(atm, bas, env).eval_ao_gradient(points, space);
 }
 
 } // namespace isdf

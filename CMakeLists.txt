@@ -166,7 +166,9 @@ target_include_directories(isdf_ao_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/i
 target_link_libraries(isdf_ao_core PUBLIC Kokkos::kokkos ${ISDF_CINT_TARGET})
 set_target_properties(isdf_ao_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(isdf_anchor_core STATIC cpp/src/anchor_select.cpp)
+add_library(isdf_anchor_core STATIC
+    cpp/src/anchor_select.cpp
+    cpp/src/anchor_select_qrcp.cpp)
 target_include_directories(isdf_anchor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
 target_link_libraries(isdf_anchor_core PUBLIC isdf_ao_core lapackpp)
 set_target_properties(isdf_anchor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

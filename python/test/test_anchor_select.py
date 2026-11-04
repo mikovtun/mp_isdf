@@ -23,7 +23,8 @@ class TestAnchorSelection(unittest.TestCase):
         cls.points = np.random.default_rng(12).normal(size=(8, 3))
         cls.weights = np.array([1., 2., 0., -1., 1., 3., 1., 1.])
 
-    def check_reference(self, axes, tolerance=1e-10, max_rank=0, occupied=False):
+    def check_reference(self, axes, tolerance=1e-10, max_rank=0, occupied=False,
+                        space="auto"):
         good = self.weights != 0
         points = self.points[good]
         ao = self.mol.eval_gto("GTOval_sph", points)
@@ -49,7 +50,7 @@ class TestAnchorSelection(unittest.TestCase):
         actual = self.selector.select(
             self.points, self.weights, axes, tolerance=tolerance,
             max_rank=max_rank, mo_coeff=c if occupied else None,
-            nocc=nocc if occupied else 0,
+            nocc=nocc if occupied else 0, space=space,
         )
         self.assertEqual(actual, expected)
         self.assertNotIn(2, actual)  # Original index of the removed zero-weight point.
@@ -63,6 +64,45 @@ class TestAnchorSelection(unittest.TestCase):
         self.check_reference([isdf_ao.AxisType.AtomicOrbitalGradZ,
                               isdf_ao.AxisType.AtomicOrbital,
                               isdf_ao.AxisType.AtomicOrbitalGradZ], max_rank=3)
+
+    def test_selection_runtime_dispatch(self):
+        axes = [isdf_ao.AxisType.AtomicOrbital,
+                isdf_ao.AxisType.AtomicOrbitalGradX]
+        spaces = ("host", "auto", "device") if isdf_ao.cuda_enabled else ("host", "auto")
+        for space in spaces:
+            with self.subTest(space=space):
+                self.check_reference(axes, max_rank=3, space=space)
+        if not isdf_ao.cuda_enabled:
+            with self.assertRaises(ValueError):
+                self.selector.select(self.points, self.weights, axes, space="device")
+        self.assertEqual(self.selector.select(self.points, np.zeros(8), axes,
+                                              space="host"), [])
+        with self.assertRaises(ValueError):
+            self.selector.select(self.points, self.weights, axes, space="invalid")
+
+    def test_axis_evaluation_on_host(self):
+        # Exercises the host AO/gradient kernels, MO projection, and axis
+        # assembly—not just compilation of the host-space template.
+        axes = [isdf_ao.AxisType.AtomicOrbitalGradZ,
+                isdf_ao.AxisType.OccupiedOrbital,
+                isdf_ao.AxisType.AtomicOrbital,
+                isdf_ao.AxisType.AtomicOrbitalGradZ]
+        c = self.mean_field.mo_coeff
+        nocc = self.mol.nelectron // 2
+        ao = self.mol.eval_gto("GTOval_sph", self.points)
+        grad_z = self.mol.eval_gto("GTOval_ip_sph", self.points)[2]
+        expected = np.hstack((grad_z, ao @ c[:, :nocc], ao, grad_z))
+        host = self.selector.evaluate_axis(self.points, axes, mo_coeff=c,
+                                           nocc=nocc, space="host")
+        default = self.selector.evaluate_axis(self.points, axes, mo_coeff=c,
+                                              nocc=nocc, space="auto")
+        if isdf_ao.cuda_enabled:
+            device = self.selector.evaluate_axis(self.points, axes, mo_coeff=c,
+                                                 nocc=nocc, space="device")
+        np.testing.assert_allclose(host, expected, rtol=1e-11, atol=1e-12)
+        np.testing.assert_allclose(host, default, rtol=1e-11, atol=1e-12)
+        if isdf_ao.cuda_enabled:
+            np.testing.assert_allclose(host, device, rtol=1e-11, atol=1e-12)
 
     def test_occupied_rhf(self):
         self.check_reference([isdf_ao.AxisType.OccupiedOrbital], occupied=True)

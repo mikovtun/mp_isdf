@@ -53,6 +53,12 @@ class TestMinimalISDF(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
 
+    def test_host_space_driver(self):
+        result = build_isdf(self.mol, level=0, max_rank=2,
+                            compute_metric=False, space="host")
+        self.assertGreater(len(result["anchor_indices"]), 0)
+        self.assertTrue(np.isfinite(result["overlap_relative_error"]))
+
     def test_occupied_feature_selection(self):
         mf = scf.RHF(self.mol).run(verbose=0)
         result = build_isdf(self.mol, mf, level=0, max_rank=2,

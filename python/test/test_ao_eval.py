@@ -69,6 +69,28 @@ class TestAOEvaluation(unittest.TestCase):
                 context.eval_ao_gradient(points), expected_grad, rtol=1e-11, atol=1e-12
             )
 
+    def test_runtime_space_dispatch(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 1", basis="cc-pvdz", verbose=0)
+        points = np.random.default_rng(17).normal(size=(7, 3))
+        ctx = isdf_ao.LibcintContext(mol._atm, mol._bas, mol._env)
+        expected = mol.eval_gto("GTOval_sph", points)
+        expected_grad = mol.eval_gto("GTOval_ip_sph", points)
+        spaces = ("host", "auto", "device") if isdf_ao.cuda_enabled else ("host", "auto")
+        for space in spaces:
+            with self.subTest(space=space):
+                np.testing.assert_allclose(ctx.eval_ao(points, space=space), expected,
+                                           rtol=1e-11, atol=1e-12)
+                np.testing.assert_allclose(ctx.eval_ao_gradient(points, space=space),
+                                           expected_grad, rtol=1e-11, atol=1e-12)
+                np.testing.assert_allclose(
+                    isdf_ao.eval_ao(mol._atm, mol._bas, mol._env, points, space=space),
+                    expected, rtol=1e-11, atol=1e-12)
+        if not isdf_ao.cuda_enabled:
+            with self.assertRaises(ValueError):
+                ctx.eval_ao(points, space="device")
+        with self.assertRaises(ValueError):
+            ctx.eval_ao(points, space="invalid")
+
     def test_empty_grid(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 1", basis="cc-pvdz", verbose=0)
         empty = np.empty((0, 3))

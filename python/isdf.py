@@ -2,7 +2,7 @@
 """Minimal grid ISDF demo adapted from ../isdf/isdf.py.
 
 PySCF builds the molecular grid; isdf_ao evaluates AOs and selects anchors
-with local QRCP (MAGMA on CUDA, LAPACK++ otherwise). The remaining ISDF fit
+with local QRCP (MAGMA on device, LAPACK++ on host). The remaining ISDF fit
 and spherical-cell Coulomb metric are NumPy reference implementations.
 
 Build first: cmake --build build --target isdf_ao
@@ -54,13 +54,14 @@ def coulomb_metric(interp_vecs, coords, weights):
 
 
 def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
-               axes=("ao",), compute_metric=True):
+               axes=("ao",), compute_metric=True, space="auto"):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
     before forming their outer product. The fitted tensor remains AO-pair ISDF.
     `max_rank=0` leaves rank to the QR diagonal tolerance. Anchor indices are
-    relative to the original, unpruned PySCF grid.
+    relative to the original, unpruned PySCF grid. `space` selects where AO
+    evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
     """
     started = time.perf_counter()
     if isinstance(axes, str):
@@ -91,7 +92,7 @@ def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
     nocc = mol.nelectron // 2 if needs_occ else 0
     anchor_indices = np.asarray(selector.select(
         all_coords, all_weights, axis_types, tolerance=tolerance,
-        max_rank=max_rank, mo_coeff=coefficients, nocc=nocc,
+        max_rank=max_rank, mo_coeff=coefficients, nocc=nocc, space=space,
     ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("QRCP found no significant anchors; adjust tolerance or grid")
@@ -99,10 +100,10 @@ def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
     # Only nonzero-weight points contribute to the ISDF fit and Coulomb metric.
     coords = all_coords[keep]
     weights = all_weights[keep]
-    ao = context.eval_ao(coords)
+    ao = context.eval_ao(coords, space=space)
     anchor_coords = all_coords[anchor_indices]
     anchor_weights = all_weights[anchor_indices]
-    anchor_ao = context.eval_ao(anchor_coords)
+    anchor_ao = context.eval_ao(anchor_coords, space=space)
     rank, nao = anchor_ao.shape
     products = (ao[:, :, None] * ao[:, None, :]).reshape(len(coords), nao * nao)
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
@@ -173,6 +174,8 @@ def main():
                         help="relative QR diagonal cutoff")
     parser.add_argument("--axes", default="ao",
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
+    parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
+                        help="where AO evaluation and QRCP run")
     parser.add_argument("--no-metric", action="store_true",
                         help="skip NumPy grid Coulomb metric")
     args = parser.parse_args()
@@ -190,7 +193,7 @@ def main():
             raise RuntimeError("RHF did not converge")
     result = build_isdf(mol, mf, level=args.level, max_rank=args.rank,
                         tolerance=args.tolerance, axes=axes,
-                        compute_metric=not args.no_metric)
+                        compute_metric=not args.no_metric, space=args.space)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
     print("Original grid anchor indices:", result["anchor_indices"])

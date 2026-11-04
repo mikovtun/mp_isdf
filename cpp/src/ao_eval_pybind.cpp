@@ -1,4 +1,5 @@
 #include "ao_eval.hpp"
+#include "evaluation_space_pybind.hpp"
 
 #include <Kokkos_Core.hpp>
 #include <pybind11/numpy.h>
@@ -45,13 +46,14 @@ std::unique_ptr<isdf::LibcintContext> make_context(const IntArray& atm,
 }
 
 py::array_t<double> evaluate(const isdf::LibcintContext& context,
-                             const FloatArray& coords, bool gradient)
+                             const FloatArray& coords, bool gradient,
+                             EvaluationSpace space)
 {
     auto points = read_points(coords);
     std::vector<double> values;
     {
         py::gil_scoped_release release;
-        values = gradient ? context.eval_ao_gradient(points) : context.eval_ao(points);
+        values = gradient ? context.eval_ao_gradient(points, space) : context.eval_ao(points, space);
     }
     std::vector<py::ssize_t> shape = gradient
         ? std::vector<py::ssize_t>{3, coords.shape(0), static_cast<py::ssize_t>(context.nao())}
@@ -67,6 +69,11 @@ void bind_anchor_select(py::module_& m);
 PYBIND11_MODULE(isdf_ao, m)
 {
     m.doc() = "Kokkos spherical AO values and gradients for libcint/PySCF tables";
+#ifdef KOKKOS_ENABLE_CUDA
+    m.attr("cuda_enabled") = true;
+#else
+    m.attr("cuda_enabled") = false;
+#endif
     const bool initialized_here = !Kokkos::is_initialized();
     if (initialized_here) Kokkos::initialize();
     m.add_object("_kokkos_lifetime", py::capsule(new bool(initialized_here), [](void* p) {
@@ -81,23 +88,31 @@ PYBIND11_MODULE(isdf_ao, m)
         "Own a private copy of libcint tables and cache AO data on the Kokkos device.")
         .def(py::init(&make_context), py::arg("atm"), py::arg("bas"), py::arg("env"))
         .def_property_readonly("nao", &isdf::LibcintContext::nao)
-        .def("eval_ao", [](const isdf::LibcintContext& ctx, const FloatArray& coords) {
-            return evaluate(ctx, coords, false);
-        }, py::arg("coords"), "Return real spherical AOs with shape (ngrid, nao).")
-        .def("eval_ao_gradient", [](const isdf::LibcintContext& ctx, const FloatArray& coords) {
-            return evaluate(ctx, coords, true);
-        }, py::arg("coords"), "Return x,y,z AO gradients with shape (3, ngrid, nao).");
+        .def("eval_ao", [](const isdf::LibcintContext& ctx, const FloatArray& coords,
+                            const std::string& space) {
+            return evaluate(ctx, coords, false, parse_evaluation_space(space));
+        }, py::arg("coords"), py::arg("space") = "auto",
+           "Return real spherical AOs with shape (ngrid, nao).")
+        .def("eval_ao_gradient", [](const isdf::LibcintContext& ctx, const FloatArray& coords,
+                                     const std::string& space) {
+            return evaluate(ctx, coords, true, parse_evaluation_space(space));
+        }, py::arg("coords"), py::arg("space") = "auto",
+           "Return x,y,z AO gradients with shape (3, ngrid, nao).");
 
     // Retain the original array-based interface for existing Python callers.
     m.def("eval_ao", [](const IntArray& atm, const IntArray& bas,
-                        const FloatArray& env, const FloatArray& coords) {
+                        const FloatArray& env, const FloatArray& coords,
+                        const std::string& space) {
         auto ctx = make_context(atm, bas, env);
-        return evaluate(*ctx, coords, false);
-    }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"));
+        return evaluate(*ctx, coords, false, parse_evaluation_space(space));
+    }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"),
+       py::arg("space") = "auto");
     m.def("eval_ao_gradient", [](const IntArray& atm, const IntArray& bas,
-                                 const FloatArray& env, const FloatArray& coords) {
+                                 const FloatArray& env, const FloatArray& coords,
+                                 const std::string& space) {
         auto ctx = make_context(atm, bas, env);
-        return evaluate(*ctx, coords, true);
-    }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"));
+        return evaluate(*ctx, coords, true, parse_evaluation_space(space));
+    }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"),
+       py::arg("space") = "auto");
     bind_anchor_select(m);
 }
