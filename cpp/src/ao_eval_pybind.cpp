@@ -62,6 +62,8 @@ py::array_t<double> evaluate(const isdf::LibcintContext& context,
 }
 } // namespace
 
+void bind_anchor_select(py::module_& m);
+
 PYBIND11_MODULE(isdf_ao, m)
 {
     m.doc() = "Kokkos spherical AO values and gradients for libcint/PySCF tables";
@@ -97,4 +99,5 @@ PYBIND11_MODULE(isdf_ao, m)
         auto ctx = make_context(atm, bas, env);
         return evaluate(*ctx, coords, true);
     }, py::arg("atm"), py::arg("bas"), py::arg("env"), py::arg("coords"));
+    bind_anchor_select(m);
 }

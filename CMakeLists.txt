@@ -44,6 +44,11 @@ if(ISDF_ENABLE_OPENMP)
 endif()
 
 FetchContent_MakeAvailable(blaspp lapackpp)
+# The embedded LAPACK++ configuration can omit the Fortran symbol-mangling
+# definition when a vendor BLAS/LAPACK is found via CMake. Our LP64 libraries
+# use the conventional trailing-underscore symbols.
+target_compile_definitions(lapackpp PUBLIC LAPACK_FORTRAN_ADD_)
+target_compile_definitions(blaspp PUBLIC BLAS_FORTRAN_ADD_)
 
 # SLATE enables its test suite by default when embedded as a dependency;
 # those tests require source-tree-only headers and are not needed here.
@@ -117,6 +122,7 @@ if(ISDF_ENABLE_CUDA)
             -DMAGMA_ENABLE_HIP=OFF
             -DUSE_FORTRAN=OFF
             -DBUILD_SHARED_LIBS=OFF
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target magma
         INSTALL_COMMAND ""
         BUILD_BYPRODUCTS "${ISDF_MAGMA_LIBRARY}"
@@ -160,9 +166,18 @@ target_include_directories(isdf_ao_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/i
 target_link_libraries(isdf_ao_core PUBLIC Kokkos::kokkos ${ISDF_CINT_TARGET})
 set_target_properties(isdf_ao_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(isdf_anchor_core STATIC cpp/src/anchor_select.cpp)
+target_include_directories(isdf_anchor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+target_link_libraries(isdf_anchor_core PUBLIC isdf_ao_core lapackpp)
+set_target_properties(isdf_anchor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(ISDF_ENABLE_CUDA)
+    target_link_libraries(isdf_anchor_core PUBLIC isdf_magma CUDA::cudart)
+    target_compile_definitions(isdf_anchor_core PRIVATE ISDF_ENABLE_CUDA=1)
+endif()
+
 # pybind11's default LTO can duplicate CUDA fatbinData during device linking.
-pybind11_add_module(isdf_ao NO_EXTRAS cpp/src/ao_eval_pybind.cpp)
-target_link_libraries(isdf_ao PRIVATE isdf_ao_core)
+pybind11_add_module(isdf_ao NO_EXTRAS cpp/src/ao_eval_pybind.cpp cpp/src/anchor_select_pybind.cpp)
+target_link_libraries(isdf_ao PRIVATE isdf_anchor_core)
 
 target_link_libraries(isdf_slate PRIVATE
     Kokkos::kokkos
