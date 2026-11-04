@@ -59,6 +59,11 @@ class TestAnchorSelection(unittest.TestCase):
         self.check_reference([isdf_ao.AxisType.AtomicOrbitalGradX,
                               isdf_ao.AxisType.AtomicOrbitalGradZ], max_rank=4)
 
+    def test_axis_concatenation_with_repeated_types(self):
+        self.check_reference([isdf_ao.AxisType.AtomicOrbitalGradZ,
+                              isdf_ao.AxisType.AtomicOrbital,
+                              isdf_ao.AxisType.AtomicOrbitalGradZ], max_rank=3)
+
     def test_occupied_rhf(self):
         self.check_reference([isdf_ao.AxisType.OccupiedOrbital], occupied=True)
         self.check_reference([isdf_ao.AxisType.OccupiedOrbital,
@@ -82,6 +87,8 @@ class TestAnchorSelection(unittest.TestCase):
         axis = isdf_ao.AxisType.OccupiedOrbital
         with self.assertRaises(ValueError):
             self.selector.select(self.points, self.weights, axis)
+        with self.assertRaises(ValueError):
+            self.selector.select(np.empty((0, 3)), np.empty(0), axis)
         with self.assertRaises(ValueError):
             self.selector.select(self.points, self.weights, axis,
                                  mo_coeff=np.ones((2, 1)), nocc=1)

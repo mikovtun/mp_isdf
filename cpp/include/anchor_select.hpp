@@ -19,6 +19,19 @@ public:
     explicit AnchorSelection(const LibcintContext& context) : context_(context) {}
     std::size_t nao() const noexcept { return context_.nao(); }
 
+    // Evaluated axis functions, row-major (points.size(), width). No weights or
+    // pair products are applied; selection algorithms can use the values to
+    // construct either a product matrix or an implicit Gram matrix.
+    struct AxisEvaluation {
+        std::size_t width;
+        std::vector<double> values;
+    };
+    AxisEvaluation evaluate_axis(
+        const std::vector<std::array<double, 3>>& points,
+        const std::vector<AxisType>& axes,
+        const std::vector<double>& mo_coeff = {},
+        std::size_t nocc = 0) const;
+
     // mo_coeff is a row-major (nao, nao) RHF matrix; nocc selects its first
     // nocc columns. Supply both if OccupiedOrbital is requested. Unused otherwise.
     // tolerance is relative to abs(R[0,0]); max_rank=0 means no explicit cap.

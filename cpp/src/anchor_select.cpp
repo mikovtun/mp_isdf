@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace isdf {
@@ -91,23 +92,13 @@ std::vector<std::int64_t> qrcp_magma(double* device_matrix,
 
 } // namespace
 
-std::vector<std::size_t> AnchorSelection::select(
+AnchorSelection::AxisEvaluation AnchorSelection::evaluate_axis(
     const std::vector<std::array<double, 3>>& points,
-    const std::vector<double>& weights,
     const std::vector<AxisType>& axes,
-    double tolerance,
-    std::size_t max_rank,
-    LocalAnchorSelectionAlgorithm algorithm,
     const std::vector<double>& mo_coeff,
     std::size_t nocc) const
 {
-    if (algorithm != LocalAnchorSelectionAlgorithm::QRColumnPivoting) {
-        throw std::logic_error("randomized QRCP is not implemented");
-    }
-    if (points.size() != weights.size() || axes.empty() ||
-        !std::isfinite(tolerance) || tolerance < 0) {
-        throw std::invalid_argument("invalid weights, axis list, or tolerance");
-    }
+    if (axes.empty()) throw std::invalid_argument("axis list must not be empty");
     const std::size_t nao = context_.nao();
     bool need_ao = false, need_grad = false, need_occ = false;
     std::size_t nfeatures = 0;
@@ -135,25 +126,19 @@ std::vector<std::size_t> AnchorSelection::select(
         need_ao = true;
     }
     if (nfeatures == 0) throw std::invalid_argument("no orbital features available");
-
-    std::vector<std::size_t> original;
-    std::vector<std::array<double, 3>> kept_points;
-    std::vector<double> kept_weights;
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        if (!std::isfinite(weights[i])) throw std::invalid_argument("grid weights must be finite");
-        if (weights[i] == 0) continue;
-        for (double x : points[i]) {
+    if (points.size() > std::numeric_limits<std::size_t>::max() / nfeatures) {
+        throw std::overflow_error("axis evaluation is too large");
+    }
+    // Empty grids still validate the axis, without calling the AO evaluator.
+    if (points.empty()) return {nfeatures, {}};
+    for (const auto& point : points) {
+        for (double x : point) {
             if (!std::isfinite(x)) throw std::invalid_argument("grid coordinates must be finite");
         }
-        original.push_back(i);
-        kept_points.push_back(points[i]);
-        kept_weights.push_back(weights[i]);
     }
-    if (kept_points.empty()) return {};
-    check_product_size(nfeatures, kept_points.size());
-    const auto ao = need_ao ? context_.eval_ao(kept_points) : std::vector<double>{};
-    const auto grad = need_grad ? context_.eval_ao_gradient(kept_points) : std::vector<double>{};
-    const std::size_t ng = kept_points.size();
+    const auto ao = need_ao ? context_.eval_ao(points) : std::vector<double>{};
+    const auto grad = need_grad ? context_.eval_ao_gradient(points) : std::vector<double>{};
+    const std::size_t ng = points.size();
     std::vector<double> features(ng * nfeatures);
     for (std::size_t g = 0; g < ng; ++g) {
         std::size_t column = 0;
@@ -186,6 +171,45 @@ std::vector<std::size_t> AnchorSelection::select(
             }
         }
     }
+    return {nfeatures, std::move(features)};
+}
+
+std::vector<std::size_t> AnchorSelection::select(
+    const std::vector<std::array<double, 3>>& points,
+    const std::vector<double>& weights,
+    const std::vector<AxisType>& axes,
+    double tolerance,
+    std::size_t max_rank,
+    LocalAnchorSelectionAlgorithm algorithm,
+    const std::vector<double>& mo_coeff,
+    std::size_t nocc) const
+{
+    if (algorithm != LocalAnchorSelectionAlgorithm::QRColumnPivoting) {
+        throw std::logic_error("randomized QRCP is not implemented");
+    }
+    if (points.size() != weights.size() ||
+        !std::isfinite(tolerance) || tolerance < 0) {
+        throw std::invalid_argument("invalid weights, axis list, or tolerance");
+    }
+    std::vector<std::size_t> original;
+    std::vector<std::array<double, 3>> kept_points;
+    std::vector<double> kept_weights;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        if (!std::isfinite(weights[i])) throw std::invalid_argument("grid weights must be finite");
+        if (weights[i] == 0) continue;
+        for (double x : points[i]) {
+            if (!std::isfinite(x)) throw std::invalid_argument("grid coordinates must be finite");
+        }
+        original.push_back(i);
+        kept_points.push_back(points[i]);
+        kept_weights.push_back(weights[i]);
+    }
+    const auto axis = evaluate_axis(kept_points, axes, mo_coeff, nocc);
+    if (kept_points.empty()) return {};
+    const std::size_t nfeatures = axis.width;
+    const auto& features = axis.values;
+    check_product_size(nfeatures, kept_points.size());
+    const std::size_t ng = kept_points.size();
 
     // A = weighted product^T; columns of A correspond to grid points.
     // Kokkos writes columns contiguously so LAPACK/MAGMA can consume them.
