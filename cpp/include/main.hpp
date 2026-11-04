@@ -2,7 +2,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <slate/slate.hh>
-#include <cint.h>
+#include <libcint_wrapper.hpp>
 #include <pybind11/embed.h>
 
 #ifdef ISDF_ENABLE_MPI
@@ -12,6 +12,3 @@
 #ifdef ISDF_ENABLE_CUDA
 #include <cuda_runtime.h>
 #endif
-
-
-#include <libcint_wrapper.hpp>

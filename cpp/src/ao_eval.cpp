@@ -7,6 +7,7 @@
 #include <limits>
 #include <numbers>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace isdf {
@@ -50,28 +51,48 @@ void check_range(FINT offset, FINT length, std::size_t size)
     }
 }
 
+LibcintWrapper make_tables(std::vector<FINT>& atm, std::vector<FINT>& bas,
+                           std::vector<double>& env)
+{
+    if (atm.size() % ATM_SLOTS || bas.size() % BAS_SLOTS ||
+        atm.size() / ATM_SLOTS > static_cast<std::size_t>(std::numeric_limits<FINT>::max()) ||
+        bas.size() / BAS_SLOTS > static_cast<std::size_t>(std::numeric_limits<FINT>::max())) {
+        throw std::invalid_argument("invalid libcint ATM/BAS layout");
+    }
+    const auto natm = static_cast<FINT>(atm.size() / ATM_SLOTS);
+    const auto nbas = static_cast<FINT>(bas.size() / BAS_SLOTS);
+    return LibcintWrapper(std::move(atm), std::move(bas), std::move(env), natm, nbas);
+}
+
 } // namespace
 
-std::vector<double> eval_ao(const std::vector<FINT>& atm,
-                            const std::vector<FINT>& bas,
-                            const std::vector<double>& env,
-                            const std::vector<std::array<double, 3>>& points)
+struct LibcintContext::Impl {
+    using Device = Kokkos::DefaultExecutionSpace;
+    Kokkos::View<Shell*, Device> d_shells;
+    Kokkos::View<double*, Device> d_env;
+    Kokkos::View<double*, Device> d_transforms;
+    std::size_t nao = 0;
+    std::size_t nshells = 0;
+};
+
+LibcintContext::LibcintContext(std::vector<FINT> atm, std::vector<FINT> bas,
+                               std::vector<double> env)
+    : tables_(make_tables(atm, bas, env)), impl_(std::make_unique<Impl>())
 {
     if (!Kokkos::is_initialized()) {
-        throw std::logic_error("Kokkos must be initialized before eval_ao");
+        throw std::logic_error("Kokkos must be initialized before creating LibcintContext");
     }
-    if (atm.size() % ATM_SLOTS || bas.size() % BAS_SLOTS || env.size() < PTR_ENV_START) {
-        throw std::invalid_argument("invalid libcint ATM/BAS/ENV layout");
-    }
-
-    const auto nbas = bas.size() / BAS_SLOTS;
-    const auto natm = atm.size() / ATM_SLOTS;
+    const auto& atoms = tables_.atm_vec();
+    const auto& basis = tables_.bas_vec();
+    const auto& environment = tables_.env_vec();
+    const auto nbas = static_cast<std::size_t>(tables_.nbas());
+    const auto natm = static_cast<std::size_t>(tables_.natm());
     std::vector<Shell> shells;
     shells.reserve(nbas);
     std::vector<double> transforms;
     std::size_t nao = 0;
     for (std::size_t i = 0; i < nbas; ++i) {
-        const FINT* b = bas.data() + i * BAS_SLOTS;
+        const FINT* b = basis.data() + i * BAS_SLOTS;
         const FINT atom = b[ATOM_OF];
         const FINT l = b[ANG_OF];
         const FINT np = b[NPRIM_OF];
@@ -83,10 +104,10 @@ std::vector<double> eval_ao(const std::vector<FINT>& atm,
         }
         const int ncart = (l + 1) * (l + 2) / 2;
         const int nsph = 2 * l + 1;
-        check_range(b[PTR_EXP], np, env.size());
-        check_range(b[PTR_COEFF], np * nc, env.size());
-        const FINT coord = atm[static_cast<std::size_t>(atom) * ATM_SLOTS + PTR_COORD];
-        check_range(coord, 3, env.size());
+        check_range(b[PTR_EXP], np, environment.size());
+        check_range(b[PTR_COEFF], np * nc, environment.size());
+        const FINT coord = atoms[static_cast<std::size_t>(atom) * ATM_SLOTS + PTR_COORD];
+        check_range(coord, 3, environment.size());
         if (nao + static_cast<std::size_t>(nsph) * nc >
             static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             transforms.size() + static_cast<std::size_t>(nsph) * ncart >
@@ -95,7 +116,7 @@ std::vector<double> eval_ao(const std::vector<FINT>& atm,
         }
         shells.push_back({l, np, nc, ncart, nsph,
                           b[PTR_EXP], b[PTR_COEFF], static_cast<int>(transforms.size()),
-                          static_cast<int>(nao), env[coord], env[coord + 1], env[coord + 2]});
+                          static_cast<int>(nao), environment[coord], environment[coord + 1], environment[coord + 2]});
         nao += static_cast<std::size_t>(nsph) * nc;
 
         // Generate libcint's exact real-spherical cart-to-spherical matrix on
@@ -120,38 +141,59 @@ std::vector<double> eval_ao(const std::vector<FINT>& atm,
         }
     }
 
-    if (nao && points.size() > std::numeric_limits<std::size_t>::max() / nao) {
+    impl_->nao = nao;
+    impl_->nshells = shells.size();
+    impl_->d_shells = decltype(impl_->d_shells)("ao_shells", shells.size());
+    impl_->d_env = decltype(impl_->d_env)("ao_env", environment.size());
+    impl_->d_transforms = decltype(impl_->d_transforms)("ao_transform", transforms.size());
+    auto h_shells = Kokkos::create_mirror_view(impl_->d_shells);
+    auto h_env = Kokkos::create_mirror_view(impl_->d_env);
+    auto h_transforms = Kokkos::create_mirror_view(impl_->d_transforms);
+    for (std::size_t i = 0; i < shells.size(); ++i) h_shells(i) = shells[i];
+    for (std::size_t i = 0; i < environment.size(); ++i) h_env(i) = environment[i];
+    for (std::size_t i = 0; i < transforms.size(); ++i) h_transforms(i) = transforms[i];
+    Kokkos::deep_copy(impl_->d_shells, h_shells);
+    Kokkos::deep_copy(impl_->d_env, h_env);
+    Kokkos::deep_copy(impl_->d_transforms, h_transforms);
+}
+
+LibcintContext::~LibcintContext() = default;
+
+std::size_t LibcintContext::nao() const noexcept { return impl_->nao; }
+
+std::vector<double> LibcintContext::evaluate(
+    const std::vector<std::array<double, 3>>& points, bool gradient) const
+{
+    if (!Kokkos::is_initialized()) {
+        throw std::logic_error("Kokkos must be initialized before AO evaluation");
+    }
+    const std::size_t nao = impl_->nao;
+    const std::size_t components = gradient ? 3 : 1;
+    if (nao && (points.size() > std::numeric_limits<std::size_t>::max() / nao ||
+                points.size() * nao > std::numeric_limits<std::size_t>::max() / components)) {
         throw std::overflow_error("AO result is too large");
     }
-    std::vector<double> result(points.size() * nao);
+    std::vector<double> result(components * points.size() * nao);
     if (points.empty() || nao == 0) return result;
 
     using Device = Kokkos::DefaultExecutionSpace;
-    Kokkos::View<Shell*, Device> d_shells("ao_shells", shells.size());
-    Kokkos::View<double*, Device> d_env("ao_env", env.size());
-    Kokkos::View<double*, Device> d_transforms("ao_transform", transforms.size());
+    const auto d_shells = impl_->d_shells;
+    const auto d_env = impl_->d_env;
+    const auto d_transforms = impl_->d_transforms;
     Kokkos::View<double*[3], Device> d_points("ao_points", points.size());
-    Kokkos::View<double**, Kokkos::LayoutRight, Device> d_result("ao_result", points.size(), nao);
-    auto h_shells = Kokkos::create_mirror_view(d_shells);
-    auto h_env = Kokkos::create_mirror_view(d_env);
-    auto h_transforms = Kokkos::create_mirror_view(d_transforms);
+    Kokkos::View<double*, Device> d_result("ao_result", result.size());
     auto h_points = Kokkos::create_mirror_view(d_points);
-    for (std::size_t i = 0; i < shells.size(); ++i) h_shells(i) = shells[i];
-    for (std::size_t i = 0; i < env.size(); ++i) h_env(i) = env[i];
-    for (std::size_t i = 0; i < transforms.size(); ++i) h_transforms(i) = transforms[i];
     for (std::size_t i = 0; i < points.size(); ++i) {
         for (int k = 0; k < 3; ++k) h_points(i, k) = points[i][k];
     }
-    Kokkos::deep_copy(d_shells, h_shells);
-    Kokkos::deep_copy(d_env, h_env);
-    Kokkos::deep_copy(d_transforms, h_transforms);
     Kokkos::deep_copy(d_points, h_points);
 
     // One work item per (grid point, shell). Every item owns disjoint output
     // columns; no atomics or device-side allocation are needed.
     using Policy = Kokkos::MDRangePolicy<Device, Kokkos::Rank<2>>;
+    const std::size_t npoints = points.size();
     Kokkos::parallel_for("isdf_eval_ao",
-                         Policy({0, 0}, {points.size(), shells.size()}),
+                         Policy({0, 0}, {npoints, impl_->nshells}),
                          KOKKOS_LAMBDA(const std::size_t p, const std::size_t sh) {
         const Shell b = d_shells(sh);
         const double x = d_points(p, 0) - b.x;
@@ -160,28 +202,74 @@ std::vector<double> eval_ao(const std::vector<FINT>& atm,
         const double r2 = x*x + y*y + z*z;
         for (int ctr = 0; ctr < b.nctr; ++ctr) {
             double radial = 0.0;
+            double radial_prime = 0.0; // derivative w.r.t. r^2
             for (int prim = 0; prim < b.nprim; ++prim) {
-                radial += d_env(b.coeff_offset + ctr * b.nprim + prim) *
-                          exp(-d_env(b.exp_offset + prim) * r2);
+                const double alpha = d_env(b.exp_offset + prim);
+                const double term = d_env(b.coeff_offset + ctr * b.nprim + prim) *
+                                    exp(-alpha * r2);
+                radial += term;
+                if (gradient) radial_prime -= alpha * term;
             }
             for (int s = 0; s < b.nsph; ++s) {
-                double value = 0.0;
+                double value = 0.0, dx = 0.0, dy = 0.0, dz = 0.0;
                 for (int c = 0; c < b.ncart; ++c) {
                     int lx, ly, lz;
                     cartesian_powers(b.l, c, lx, ly, lz);
-                    value += d_transforms(b.transform_offset + s*b.ncart + c) *
-                             integer_power(x, lx) * integer_power(y, ly) *
-                             integer_power(z, lz);
+                    const double px = integer_power(x, lx);
+                    const double py = integer_power(y, ly);
+                    const double pz = integer_power(z, lz);
+                    const double t = d_transforms(b.transform_offset + s*b.ncart + c);
+                    value += t * px * py * pz;
+                    if (gradient) {
+                        if (lx) dx += t * lx * integer_power(x, lx-1) * py * pz;
+                        if (ly) dy += t * ly * px * integer_power(y, ly-1) * pz;
+                        if (lz) dz += t * lz * px * py * integer_power(z, lz-1);
+                    }
                 }
-                d_result(p, b.ao_offset + ctr * b.nsph + s) = radial * value;
+                const std::size_t index = p * nao + b.ao_offset + ctr * b.nsph + s;
+                if (gradient) {
+                    const std::size_t stride = npoints * nao;
+                    d_result(index) = radial * dx + 2.0 * x * radial_prime * value;
+                    d_result(stride + index) = radial * dy + 2.0 * y * radial_prime * value;
+                    d_result(2 * stride + index) = radial * dz + 2.0 * z * radial_prime * value;
+                } else {
+                    d_result(index) = radial * value;
+                }
             }
         }
     });
     auto h_result = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d_result);
-    for (std::size_t p = 0; p < points.size(); ++p) {
-        for (std::size_t a = 0; a < nao; ++a) result[p * nao + a] = h_result(p, a);
-    }
+    for (std::size_t i = 0; i < result.size(); ++i) result[i] = h_result(i);
     return result;
+}
+
+std::vector<double> LibcintContext::eval_ao(
+    const std::vector<std::array<double, 3>>& points) const
+{
+    return evaluate(points, false);
+}
+
+std::vector<double> LibcintContext::eval_ao_gradient(
+    const std::vector<std::array<double, 3>>& points) const
+{
+    return evaluate(points, true);
+}
+
+std::vector<double> eval_ao(const std::vector<FINT>& atm,
+                            const std::vector<FINT>& bas,
+                            const std::vector<double>& env,
+                            const std::vector<std::array<double, 3>>& points)
+{
+    return LibcintContext(atm, bas, env).eval_ao(points);
+}
+
+std::vector<double> eval_ao_gradient(
+    const std::vector<FINT>& atm,
+    const std::vector<FINT>& bas,
+    const std::vector<double>& env,
+    const std::vector<std::array<double, 3>>& points)
+{
+    return LibcintContext(atm, bas, env).eval_ao_gradient(points);
 }
 
 } // namespace isdf

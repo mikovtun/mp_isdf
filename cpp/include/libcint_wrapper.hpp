@@ -1,6 +1,9 @@
 #pragma once
 
+// libcint's generated header does not provide C++ linkage guards.
+extern "C" {
 #include <cint.h>
+}
 
 #include <array>
 #include <cstddef>
