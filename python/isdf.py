@@ -109,12 +109,21 @@ def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
     weighted_pairs = anchor_pairs * anchor_weights[:, None]
     gram = weighted_pairs @ weighted_pairs.T
     transform = np.linalg.pinv(gram, rcond=1e-12) @ weighted_pairs
-    # Preserve the original script's quadrature-weighted interpolation vectors.
-    interp_vecs = (products @ transform.T * weights[:, None]).T
+    # Unweighted interpolation vectors; quadrature weights are applied only
+    # where an integral is evaluated, not stored in the vectors themselves.
+    interp_vecs = (products @ transform.T).T
+
+    overlap = mol.intor("int1e_ovlp")
+    overlap_approx = np.einsum(
+        "ku,kv,k->uv", anchor_ao, anchor_ao,
+        anchor_weights * (interp_vecs @ weights), optimize=True,
+    )
+    overlap_relative_error = (np.linalg.norm(overlap_approx - overlap) /
+                              max(np.linalg.norm(overlap), 1e-30))
 
     metric = None
     if compute_metric:
-        metric = coulomb_metric(interp_vecs / weights[None, :], coords, weights)
+        metric = coulomb_metric(interp_vecs, coords, weights)
         metric = anchor_weights[:, None] * metric * anchor_weights[None, :]
     return {
         "anchor_indices": anchor_indices,
@@ -123,6 +132,8 @@ def build_isdf(mol, mf=None, *, level=0, max_rank=0, tolerance=1e-10,
         "coordinates": coords,
         "weights": weights,
         "interp_vecs": interp_vecs,
+        "overlap_reconstruction": overlap_approx,
+        "overlap_relative_error": overlap_relative_error,
         "coulomb_metric": metric,
         "X1": anchor_ao, "X2": anchor_ao, "X3": anchor_ao, "X4": anchor_ao,
         "elapsed": time.perf_counter() - started,
@@ -183,6 +194,7 @@ def main():
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
     print("Original grid anchor indices:", result["anchor_indices"])
+    print(f"Overlap reconstruction relative error: {result['overlap_relative_error']:.3e}")
     if result["coulomb_metric"] is not None:
         print("Coulomb metric shape:", result["coulomb_metric"].shape)
     print(f"ISDF build time: {result['elapsed']:.3f} s")

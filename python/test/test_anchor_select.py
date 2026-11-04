@@ -9,7 +9,7 @@ import numpy as np
 from scipy.linalg import qr
 from pyscf import gto, scf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "build"))
 import isdf_ao
 
 

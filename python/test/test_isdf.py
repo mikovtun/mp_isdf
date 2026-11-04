@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 from pyscf import dft, gto, scf
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isdf import build_isdf, isdf_ao
 
 
@@ -33,6 +33,25 @@ class TestMinimalISDF(unittest.TestCase):
         np.testing.assert_allclose(result["coulomb_metric"],
                                    result["coulomb_metric"].T, atol=1e-12)
         np.testing.assert_allclose(result["X1"], context.eval_ao(result["anchor_coords"]))
+        ao = context.eval_ao(result["coordinates"])
+        products = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
+        anchor_ao = result["X1"]
+        weighted_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, -1)
+        weighted_pairs *= result["anchor_weights"][:, None]
+        transform = np.linalg.pinv(weighted_pairs @ weighted_pairs.T, rcond=1e-12) @ weighted_pairs
+        expected_interp = (products @ transform.T).T
+        np.testing.assert_allclose(result["interp_vecs"], expected_interp, rtol=1e-12, atol=1e-12)
+        approx = anchor_ao.T @ (
+            (result["anchor_weights"] * (result["interp_vecs"] @ result["weights"]))[:, None]
+            * anchor_ao
+        )
+        np.testing.assert_allclose(result["overlap_reconstruction"], approx)
+        overlap = self.mol.intor("int1e_ovlp")
+        np.testing.assert_allclose(
+            result["overlap_relative_error"],
+            np.linalg.norm(approx - overlap) / np.linalg.norm(overlap),
+        )
+        self.assertTrue(np.isfinite(result["overlap_relative_error"]))
 
     def test_occupied_feature_selection(self):
         mf = scf.RHF(self.mol).run(verbose=0)
@@ -41,6 +60,7 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertGreater(len(result["anchor_indices"]), 0)
         self.assertLessEqual(len(result["anchor_indices"]), 2)
         self.assertIsNone(result["coulomb_metric"])
+        self.assertTrue(np.isfinite(result["overlap_relative_error"]))
 
 
 if __name__ == "__main__":

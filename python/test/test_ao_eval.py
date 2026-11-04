@@ -1,7 +1,7 @@
 """Compare Kokkos AO values and gradients with PySCF's native evaluator.
 
 Build the extension first: cmake --build build --target isdf_ao
-Run: OMP_PROC_BIND=false python python/test_ao_eval.py
+Run: OMP_PROC_BIND=false python -m unittest discover -s python/test -p 'test_*.py'
 """
 
 from pathlib import Path
@@ -12,7 +12,7 @@ import numpy as np
 from pyscf import gto
 
 # The CMake extension is built in the project build directory by default.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "build"))
 import isdf_ao
 
 
