@@ -1,7 +1,10 @@
 #include "coulomb_metric.hpp"
+#include "derivative_metric.hpp"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,6 +30,29 @@ void bind_coulomb_metric(py::module_& m)
     }, py::arg("context"), py::arg("tolerance")=1e-12,
        py::arg("max_rank")=0, py::arg("algorithm")="unblocked_greedy",
        "Return (factors[rank,npair], zero-based pivots, residual diagonal) in packed AO-pair order.");
+    m.def("derivative_cross_metric", [](const isdf::LibcintContext& ctx,
+                                        const FloatArray& left, std::array<int,2> left_basis,
+                                        const FloatArray& right, std::array<int,2> right_basis,
+                                        double tolerance, std::size_t max_rank) {
+        const auto npair = ctx.nao()*ctx.nao();
+        if (left.ndim()!=2 || right.ndim()!=2 ||
+            static_cast<std::size_t>(left.shape(1))!=npair ||
+            static_cast<std::size_t>(right.shape(1))!=npair)
+            throw std::invalid_argument("expected coefficient arrays [nvec,nao*nao]");
+        std::vector<double> a(left.data(),left.data()+left.size());
+        std::vector<double> b(right.data(),right.data()+right.size());
+        std::vector<double> values;
+        { py::gil_scoped_release release;
+          values = isdf::derivative_cross_metric(ctx,a,static_cast<std::size_t>(left.shape(0)),
+                     left_basis,b,static_cast<std::size_t>(right.shape(0)),right_basis,
+                     tolerance,max_rank); }
+        py::array_t<double> output({left.shape(0),right.shape(0)});
+        std::copy(values.begin(),values.end(),output.mutable_data());
+        return output;
+    },py::arg("context"),py::arg("left_coeff"),py::arg("left_basis"),
+      py::arg("right_coeff"),py::arg("right_basis"),py::arg("tolerance")=1e-12,
+      py::arg("max_rank")=0,
+      "Integral-direct joint unblocked greedy Cholesky metric for two ordered AO-pair channels.");
     m.def("coulomb_metric", [](const isdf::LibcintContext& ctx, const FloatArray& transform,
                                 const std::string& algorithm, double tolerance,
                                 std::size_t max_rank, std::size_t batch_size) {

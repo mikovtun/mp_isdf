@@ -10,7 +10,8 @@ import numpy as np
 from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from isdf import build_isdf, evaluate_isdf_jk, grid_coulomb_metric, main, mp_isdf
+from isdf import (_reference_target, build_isdf, evaluate_isdf_jk,
+                  grid_coulomb_metric, grid_cross_metric, main, mp_isdf)
 
 
 class TestMinimalISDF(unittest.TestCase):
@@ -80,6 +81,17 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertIn("grid", lines[0])
         self.assertIn("coulomb_metric", lines[-1])
 
+    def test_grid_cross_metric(self):
+        coords = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+        weights = np.array([0.3, -0.2, 0.5])
+        left = np.array([[1., 2., -1.]])
+        right = np.array([[0., 1., 3.], [2., 0., 1.]])
+        stacked = grid_coulomb_metric(np.concatenate((left, right)), coords, weights)
+        np.testing.assert_allclose(grid_cross_metric(left, right, coords, weights),
+                                   stacked[:1, 1:])
+        np.testing.assert_allclose(grid_cross_metric(right, left, coords, weights),
+                                   stacked[1:, :1])
+
     def test_grid_metric_selection(self):
         from unittest.mock import patch
         with patch.object(mp_isdf, "coulomb_metric", side_effect=AssertionError(
@@ -128,6 +140,71 @@ class TestMinimalISDF(unittest.TestCase):
             main()
         self.assertIn("J ISDF vs PySCF", output.getvalue())
         self.assertIn("K ISDF vs PySCF", output.getvalue())
+        output = io.StringIO()
+        with patch.object(sys, "argv", args + ["--derivative-target", "00zz",
+                                               "--compare"]), redirect_stdout(output):
+            main()
+        self.assertIn("PySCF target 00zz", output.getvalue())
+        output = io.StringIO()
+        with patch.object(sys, "argv", args + ["--no-metric", "--derivative-target", "00zz"]), \
+             redirect_stdout(output), \
+             patch.object(mp_isdf, "coulomb_metric", side_effect=AssertionError(
+                 "no metric should run")), \
+             patch.object(mp_isdf, "derivative_cross_metric", side_effect=AssertionError(
+                 "no derivative metric should run")):
+            main()
+        self.assertIn("overlap_check", output.getvalue())
+        self.assertIn("Overlap reconstruction relative error", output.getvalue())
+        self.assertNotIn("Derivative ERI targets", output.getvalue())
+
+    def test_0000_uses_ordinary_ao_isdf(self):
+        from unittest.mock import patch
+        for algorithm in ("unblocked_greedy", "grid"):
+            with patch.object(mp_isdf.LibcintContext, "eval_ao_gradient",
+                              side_effect=AssertionError("0000 must not evaluate AO gradients")):
+                result = build_isdf(self.mol, level=0, anchor_rank=3,
+                                    derivative_targets=("0000",), metric_algorithm=algorithm)
+            baseline = build_isdf(self.mol, level=0, anchor_rank=3,
+                                  metric_algorithm=algorithm)
+            np.testing.assert_allclose(result["coulomb_metric"], baseline["coulomb_metric"])
+            self.assertEqual(result["derivative_integrals"], {})
+            self.assertNotIn("derivative_integrals", result["timings"])
+        np.testing.assert_allclose(_reference_target(self.mol, "0000"),
+                                   self.mol.intor("int2e", aosym="s1"))
+
+    def test_two_gradient_targets_independent_of_anchor_axes(self):
+        from itertools import combinations
+        mol = gto.M(atom="H 0 0 0; H 0.3 0.2 0.74", basis="sto-3g", verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        identity = np.eye(mol.nao_nr()**2)
+        for slots in combinations(range(4), 2):
+            labels = ["0"] * 4
+            labels[slots[0]], labels[slots[1]] = "x", "z"
+            target = "".join(labels)
+            a, b = target[:2], target[2:]
+            digits = {"0": 0, "x": 1, "y": 2, "z": 3}
+            actual = mp_isdf.derivative_cross_metric(
+                ctx, identity, tuple(digits[v] for v in a),
+                identity, tuple(digits[v] for v in b), tolerance=1e-13,
+            ).reshape((mol.nao_nr(),) * 4)
+            np.testing.assert_allclose(actual, _reference_target(mol, target),
+                                       atol=1e-10, rtol=1e-10,
+                                       err_msg=f"target {target}")
+        for axes, metric in (("ao", "unblocked_greedy"),
+                             (("ao", "dz"), "grid")):
+            result = build_isdf(mol, level=0, anchor_rank=3, axes=axes,
+                                metric_algorithm=metric,
+                                derivative_targets=("00zz", "z00z"))
+            self.assertIsNotNone(result["coulomb_metric"])
+            self.assertEqual(set(result["derivative_integrals"]), {"00zz", "z00z"})
+            for integral in result["derivative_integrals"].values():
+                self.assertEqual(integral.shape, (mol.nao_nr(),)*4)
+                self.assertTrue(np.isfinite(integral).all())
+            self.assertIn("derivative_integrals", result["timings"])
+        with self.assertRaisesRegex(ValueError, "two derivatives"):
+            build_isdf(mol, derivative_targets=("x000",))
+        with self.assertRaisesRegex(ValueError, "max_derivative_bytes"):
+            build_isdf(mol, derivative_targets=("00zz",), max_derivative_bytes=1)
 
     def test_host_space_driver(self):
         result = build_isdf(self.mol, level=0, anchor_rank=2,
@@ -135,6 +212,25 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertGreater(len(result["anchor_indices"]), 0)
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
         self.assertEqual(result["timings"]["coulomb_metric"], 0.0)
+        from unittest.mock import patch
+        with patch.object(mp_isdf, "coulomb_metric", side_effect=AssertionError(
+                "no metric should run")), \
+             patch.object(mp_isdf, "derivative_cross_metric", side_effect=AssertionError(
+                 "no derivative metric should run")), \
+             patch.object(mp_isdf.LibcintContext, "eval_ao_gradient",
+                          side_effect=AssertionError("no gradient AO should run")):
+            skipped = build_isdf(self.mol, level=0, anchor_rank=2,
+                                 compute_metric=False, derivative_targets=("0000", "00zz"))
+        self.assertIsNone(skipped["coulomb_metric"])
+        self.assertEqual(skipped["derivative_integrals"], {})
+        with patch.object(mp_isdf.LibcintContext, "eval_ao",
+                          side_effect=AssertionError("selection only must skip AO fit")):
+            selected = build_isdf(self.mol, level=0, anchor_rank=2,
+                                  compute_metric=False, derivative_targets=("00zz",),
+                                  selection_only=True)
+        self.assertIsNone(selected["interp_vecs"])
+        self.assertIsNone(selected["overlap_relative_error"])
+        self.assertEqual(list(selected["timings"]), ["grid", "context", "anchor_selection"])
 
     def test_occupied_feature_selection(self):
         mf = scf.RHF(self.mol).run(verbose=0)
