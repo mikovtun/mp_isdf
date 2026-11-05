@@ -1,4 +1,4 @@
-# ISDF Slate
+# Massively Parallel ISDF
 
 A C++/Python prototype for **interpolative separable density fitting (ISDF)** of molecular AO products. PySCF supplies the molecule and integration grid; a pybind11 module evaluates atomic orbitals with libcint, selects interpolation anchors by pivoted QR, and builds Coulomb metrics. The Python driver fits the interpolation vectors and can compare reconstructed integrals or J/K matrices with PySCF.
 
