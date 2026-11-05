@@ -1,4 +1,5 @@
 #include "derivative_metric.hpp"
+#include "cholesky_update.hpp"
 #include "parallel_shell_tasks.hpp"
 #include <algorithm>
 #include <array>
@@ -164,11 +165,12 @@ std::vector<double> derivative_cross_metric(
                   << " initial_max_residual=" << initial << " cutoff=" << cutoff
                   << " diagonal_seconds=" << seconds << std::endl;
     }
+    const auto first=std::max_element(diagonal.begin(),diagonal.end());
+    CholeskyCandidate next{*first,static_cast<std::size_t>(first-diagonal.begin()),false};
     while (pivots.size()<cap) {
-        const auto it=std::max_element(diagonal.begin(),diagonal.end());
-        const double pivot_value=*it;
+        const double pivot_value=next.residual;
         if (pivot_value<=cutoff || pivot_value<=0) break;
-        const auto pivot=static_cast<std::size_t>(it-diagonal.begin());
+        const auto pivot=next.index;
         const auto pivot_channel=pivot/npair;
         const auto mu=(pivot%npair)/nao, nu=(pivot%npair)%nao;
         const auto& a=shells[ao_shell[mu]];
@@ -188,24 +190,11 @@ std::vector<double> derivative_cross_metric(
                     block[value_index(kernel,dims,{i,j,mu-a.offset,nu-b.offset})];
         });
         const auto column_finished=std::chrono::steady_clock::now();
-        const auto rank=pivots.size();
-        const auto denom=std::sqrt(pivot_value);
-        for (std::size_t p=0;p<dimension;++p) {
-            double value=column[p];
-            for (std::size_t k=0;k<rank;++k)
-                value-=factors[k*dimension+p]*factors[k*dimension+pivot];
-            column[p]=value/denom;
-            if (!std::isfinite(column[p])) throw std::runtime_error("nonfinite derivative Cholesky vector");
-        }
-        if (dimension > std::numeric_limits<std::size_t>::max()/(rank+1))
-            throw std::overflow_error("derivative Cholesky factors too large");
-        factors.insert(factors.end(),column.begin(),column.end());
+        next=correct_cholesky_column(column,factors,diagonal,pivot,pivot_value,
+                                     "derivative Cholesky factors too large",
+                                     "nonfinite derivative Cholesky vector");
         pivots.push_back(pivot);
-        for (std::size_t p=0;p<dimension;++p)
-            diagonal[p]=std::max(0.0,diagonal[p]-column[p]*column[p]);
-        diagonal[pivot]=0.0;
         if (debug) {
-            const auto next=*std::max_element(diagonal.begin(),diagonal.end());
             const auto integral_seconds=std::chrono::duration<double>(
                 column_finished-column_started).count();
             const auto update_seconds=std::chrono::duration<double>(
@@ -213,14 +202,14 @@ std::vector<double> derivative_cross_metric(
             std::cerr << "[cholesky derivative] rank=" << pivots.size()
                       << " channel=" << pivot_channel << " pivot=(" << mu << ',' << nu
                       << ") shell_pair=(" << a.id << ',' << b.id << ") pivot_residual="
-                      << pivot_value << " max_remaining=" << next
+                      << pivot_value << " max_remaining=" << next.residual
                       << " column_quartets=" << 2*shell_pair_count
                       << " integral_seconds=" << integral_seconds
                       << " update_seconds=" << update_seconds << std::endl;
         }
     }
     if (debug) {
-        const auto remaining=*std::max_element(diagonal.begin(),diagonal.end());
+        const auto remaining=next.residual;
         std::cerr << "[cholesky derivative] stop rank=" << pivots.size()
                   << " max_remaining=" << remaining
                   << " reason=" << (remaining==0.0 ? "zero_residual" :

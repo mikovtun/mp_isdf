@@ -427,6 +427,8 @@ def main():
                         help="relative Cholesky residual cutoff (ignored for --metric grid)")
     parser.add_argument("--metric-rank", type=int, default=0,
                         help="maximum ERI Cholesky rank (0: tolerance only; ignored for grid)")
+    parser.add_argument("--metric-batch-size", type=int, default=64,
+                        help="AO projection rows per BLAS++ batch (default: 64)")
     parser.add_argument("--derivative-target", action="append", default=[],
                         help="ERI slots (0000 for ordinary AOs; e.g. 00xy or x00y for derivatives); "
                              "repeat, or use 'all' for two derivatives")
@@ -448,6 +450,8 @@ def main():
         parser.error("--metric-tol must be finite and nonnegative")
     if args.metric_rank < 0:
         parser.error("--metric-rank must be nonnegative")
+    if args.metric_batch_size <= 0:
+        parser.error("--metric-batch-size must be positive")
     if args.compare and args.no_metric:
         parser.error("--compare requires a metric (omit --no-metric)")
     runner_started = time.perf_counter()
@@ -465,6 +469,7 @@ def main():
                         compute_metric=not args.no_metric, space=args.space,
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
+                        metric_batch_size=args.metric_batch_size,
                         derivative_targets=args.derivative_target,
                         report_timings=not args.debug, debug=args.debug)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "

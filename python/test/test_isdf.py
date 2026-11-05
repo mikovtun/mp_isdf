@@ -86,14 +86,16 @@ class TestMinimalISDF(unittest.TestCase):
     def test_debug_cholesky_and_deferred_timings(self):
         command = [sys.executable, str(Path(__file__).resolve().parents[1] / "isdf.py"),
                    "--anchor-rank", "3", "--metric-rank", "2",
-                   "--derivative-target", "00zz", "--debug", "--compare",
+                   "--metric-batch-size", "1", "--derivative-target", "00zz",
+                   "--debug", "--compare",
                    "--space", "host"]
         environment = {**os.environ, "OMP_NUM_THREADS": "2", "OMP_PROC_BIND": "false",
                        "OPENBLAS_NUM_THREADS": "1"}
         completed = subprocess.run(command, check=True, capture_output=True, text=True,
                                    env=environment, timeout=60)
         for text in ("[cholesky ao] rank=1", "[cholesky derivative] rank=1",
-                     "column_quartets=", "max_remaining=", "reason=rank_limit"):
+                     "column_quartets=", "max_remaining=", "reason=rank_limit",
+                     "projection_seconds=", "metric_gemm_seconds="):
             self.assertIn(text, completed.stderr)
         self.assertIn("Timing report:", completed.stdout)
         self.assertLess(completed.stdout.index("PySCF target 00zz:"),

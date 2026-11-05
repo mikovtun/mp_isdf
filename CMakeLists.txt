@@ -179,7 +179,7 @@ endif()
 
 add_library(isdf_coulomb_core STATIC cpp/src/coulomb_metric.cpp cpp/src/derivative_metric.cpp)
 target_include_directories(isdf_coulomb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
-target_link_libraries(isdf_coulomb_core PUBLIC mp_isdf_orbitals)
+target_link_libraries(isdf_coulomb_core PUBLIC mp_isdf_orbitals blaspp)
 set_target_properties(isdf_coulomb_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # pybind11's default LTO can duplicate CUDA fatbinData during device linking.

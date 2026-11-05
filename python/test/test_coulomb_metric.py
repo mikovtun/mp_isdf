@@ -55,6 +55,69 @@ class TestCoulombMetric(unittest.TestCase):
     def test_p_shell(self):
         self.check_molecule(gto.M(atom='He 0 0 0', basis='cc-pvdz', verbose=0))
 
+    @staticmethod
+    def reference_greedy(matrix, max_rank):
+        residual = np.maximum(0.0, np.diag(matrix).copy())
+        factors, pivots = [], []
+        for _ in range(max_rank):
+            pivot = int(np.argmax(residual))  # first index on an exact tie
+            maximum = residual[pivot]
+            if maximum <= 0:
+                break
+            column = matrix[:, pivot].copy()
+            for factor in factors:
+                column -= factor * factor[pivot]
+            column /= np.sqrt(maximum)
+            factors.append(column)
+            pivots.append(pivot)
+            residual = np.maximum(0.0, residual - column**2)
+            residual[pivot] = 0.0
+        return np.array(factors), pivots, residual
+
+    def test_parallel_correction_and_pivot_reduction(self):
+        # 14 AOs give 105 packed pairs, above the host reduction threshold.
+        mol = gto.M(atom='He 0 0 0', basis='cc-pvtz', verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        mu, nu = np.tril_indices(mol.nao_nr())
+        eri = mol.intor('int2e', aosym='s1')
+        matrix = eri[mu[:, None], nu[:, None], mu[None, :], nu[None, :]]
+        expected, pivots, residual = self.reference_greedy(matrix, 4)
+        actual, selected, remainder = mp_isdf.cholesky_eri(ctx, tolerance=0, max_rank=4)
+        np.testing.assert_array_equal(selected, pivots)
+        np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+        np.testing.assert_allclose(remainder, residual, atol=1e-12, rtol=1e-12)
+        # Many small batches exercise the parallel BLAS++ projection and Gram
+        # paths; the ordered AO transform must fold off-diagonal pairs once.
+        transform = np.random.default_rng(91).normal(size=(19, mol.nao_nr()**2))
+        ordered = transform.reshape(19, mol.nao_nr(), mol.nao_nr())
+        packed = ordered[:, mu, nu].copy()
+        packed[:, mu != nu] += ordered[:, nu[mu != nu], mu[mu != nu]]
+        projected = packed @ actual.T
+        expected_metric = projected @ projected.T
+        for batch in (1, 2, 64):
+            metric = mp_isdf.coulomb_metric(ctx, transform, max_rank=4,
+                                            tolerance=0, batch_size=batch)
+            np.testing.assert_allclose(metric, expected_metric, atol=2e-10, rtol=2e-10)
+            np.testing.assert_allclose(metric, metric.T, atol=1e-12)
+
+    def test_parallel_derivative_correction_and_reduction(self):
+        # Two 10x10 ordered channels give 200 pairs, above the threshold.
+        mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='cc-pvdz', verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        npair = mol.nao_nr()**2
+        identity = np.eye(npair)
+        ordinary = mol.intor('int2e', aosym='s1').reshape(npair, npair)
+        mixed = (mol.intor('int2e_ipvip1', comp=9, aosym='s1')[8]
+                 .transpose(2, 3, 0, 1).reshape(npair, npair))
+        derivative = (mol.intor('int2e_ipvip1ipvip2', comp=81, aosym='s1')[80]
+                      .reshape(npair, npair))
+        matrix = np.block([[ordinary, mixed], [mixed.T, derivative]])
+        factors, _, _ = self.reference_greedy(matrix, 3)
+        expected = factors[:, :npair].T @ factors[:, npair:]
+        actual = mp_isdf.derivative_cross_metric(
+            ctx, identity, (0, 0), identity, (3, 3), tolerance=0, max_rank=3)
+        np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=1e-10)
+
     def test_parallel_derivative_shell_quartets(self):
         # cc-pVDZ has multiple s and p shells: both channels have enough
         # ordered shell-pair tasks to run the parallel host path.

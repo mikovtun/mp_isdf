@@ -1,10 +1,14 @@
 #include "coulomb_metric.hpp"
+#include "cholesky_update.hpp"
 #include "parallel_shell_tasks.hpp"
+
+#include <blas.hh>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -101,11 +105,13 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance,
                   << " initial_max_residual=" << initial << " cutoff=" << cutoff
                   << " diagonal_seconds=" << seconds << std::endl;
     }
+    const auto first = std::max_element(result.residual.begin(), result.residual.end());
+    CholeskyCandidate next{*first,
+                           static_cast<std::size_t>(first-result.residual.begin()), false};
     while (result.pivots.size() < cap) {
-        const auto it = std::max_element(result.residual.begin(), result.residual.end());
-        const double maximum = *it;
+        const double maximum = next.residual;
         if (maximum <= cutoff || maximum <= 0.0) break;
-        const std::size_t pivot = static_cast<std::size_t>(it - result.residual.begin());
+        const std::size_t pivot = next.index;
         // Invert the packed index without floating-point rounding.
         std::size_t lo = 0, hi = nao;
         while (lo + 1 < hi) {
@@ -134,24 +140,12 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance,
                 }
         });
         const auto column_finished = std::chrono::steady_clock::now();
-        const auto rank = result.pivots.size();
-        const double denom = std::sqrt(maximum);
-        for (std::size_t p = 0; p < npair; ++p) {
-            double value = column[p];
-            for (std::size_t k = 0; k < rank; ++k)
-                value -= result.factors[k*npair+p] * result.factors[k*npair+pivot];
-            column[p] = value / denom;
-            if (!std::isfinite(column[p])) throw std::runtime_error("non-finite Cholesky vector");
-        }
-        if (npair > std::numeric_limits<std::size_t>::max() / (rank + 1))
-            throw std::overflow_error("Cholesky factor dimensions overflow size_t");
+        next = correct_cholesky_column(column, result.factors, result.residual,
+                                       pivot, maximum,
+                                       "Cholesky factor dimensions overflow size_t",
+                                       "non-finite Cholesky vector");
         result.pivots.push_back(pivot);
-        result.factors.insert(result.factors.end(), column.begin(), column.end());
-        for (std::size_t p = 0; p < npair; ++p)
-            result.residual[p] = std::max(0.0, result.residual[p] - column[p]*column[p]);
-        result.residual[pivot] = 0.0;
         if (debug) {
-            const auto next = *std::max_element(result.residual.begin(), result.residual.end());
             const auto integral_seconds = std::chrono::duration<double>(
                 column_finished - column_started).count();
             const auto update_seconds = std::chrono::duration<double>(
@@ -159,14 +153,14 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance,
             std::cerr << "[cholesky ao] rank=" << result.pivots.size()
                       << " pivot=(" << mu << ',' << nu << ") shell_pair=("
                       << a.id << ',' << b.id << ") pivot_residual=" << maximum
-                      << " max_remaining=" << next
+                      << " max_remaining=" << next.residual
                       << " column_quartets=" << shell_pairs.size()
                       << " integral_seconds=" << integral_seconds
                       << " update_seconds=" << update_seconds << std::endl;
         }
     }
     if (debug) {
-        const auto remaining = *std::max_element(result.residual.begin(), result.residual.end());
+        const auto remaining = next.residual;
         std::cerr << "[cholesky ao] stop rank=" << result.pivots.size()
                   << " max_remaining=" << remaining
                   << " reason=" << (remaining == 0.0 ? "zero_residual" :
@@ -196,26 +190,62 @@ std::vector<double> coulomb_metric(const LibcintContext& ctx,
     std::vector<double> metric(nvec*nvec, 0.0);
     if (rank && nvec > std::numeric_limits<std::size_t>::max()/rank)
         throw std::overflow_error("projection dimensions overflow size_t");
+    if (rank == 0 || nvec == 0) return metric;
+    if (nvec > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) ||
+        npair > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) ||
+        rank > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()))
+        throw std::overflow_error("BLAS++ metric dimensions exceed int64_t");
     std::vector<double> projection(nvec*rank, 0.0);
-    for (std::size_t first = 0; first < nvec; first += std::min(batch_size,nvec-first)) {
-        const auto end = first + std::min(batch_size,nvec-first);
-        for (std::size_t v = first; v < end; ++v)
+    const auto batches = nvec/batch_size + (nvec%batch_size != 0);
+    if (debug)
+        std::cerr << "[cholesky ao] projection start vectors=" << nvec
+                  << " pairs=" << npair << " rank=" << rank
+                  << " batches=" << batches << std::endl;
+    const auto projection_started = std::chrono::steady_clock::now();
+    // Pack only one batch per task. The ordered input contains both (mu,nu)
+    // and (nu,mu); packed factors use just mu>=nu, so off-diagonal
+    // coefficients must be summed before the GEMM.
+    parallel_shell_tasks("isdf_metric_projection_batches", batches, [&](std::size_t task) {
+        const auto first = task*batch_size;
+        const auto rows = std::min(batch_size, nvec-first);
+        if (rows > std::numeric_limits<std::size_t>::max()/npair)
+            throw std::overflow_error("packed projection batch dimensions overflow size_t");
+        std::vector<double> packed(rows*npair);
+        for (std::size_t v = 0; v < rows; ++v)
             for (std::size_t mu = 0; mu < nao; ++mu)
-                for (std::size_t nu = 0; nu <= mu; ++nu) {
-                    const double coeff = transform[v*nao*nao+mu*nao+nu] +
-                        (mu == nu ? 0.0 : transform[v*nao*nao+nu*nao+mu]);
-                    const auto p = pair_index(mu,nu);
-                    for (std::size_t k = 0; k < rank; ++k)
-                        projection[v*rank+k] += coeff*decomposition.factors[k*npair+p];
-                }
-    }
-    for (std::size_t v = 0; v < nvec; ++v)
-        for (std::size_t w = 0; w <= v; ++w) {
-            double sum = 0.0;
-            for (std::size_t k = 0; k < rank; ++k)
-                sum += projection[v*rank+k]*projection[w*rank+k];
-            metric[v*nvec+w] = metric[w*nvec+v] = sum;
-        }
+                for (std::size_t nu = 0; nu <= mu; ++nu)
+                    packed[v*npair+pair_index(mu,nu)] =
+                        transform[(first+v)*nao*nao+mu*nao+nu] +
+                        (mu == nu ? 0.0 : transform[(first+v)*nao*nao+nu*nao+mu]);
+        blas::gemm(blas::Layout::RowMajor, blas::Op::NoTrans, blas::Op::Trans,
+                   static_cast<int64_t>(rows), static_cast<int64_t>(rank),
+                   static_cast<int64_t>(npair), 1.0, packed.data(),
+                   static_cast<int64_t>(npair), decomposition.factors.data(),
+                   static_cast<int64_t>(npair), 0.0, projection.data()+first*rank,
+                   static_cast<int64_t>(rank));
+    });
+    const auto projection_finished = std::chrono::steady_clock::now();
+    if (debug)
+        std::cerr << "[cholesky ao] projection_seconds="
+                  << std::chrono::duration<double>(projection_finished-projection_started).count()
+                  << " metric_gemm start" << std::endl;
+    // Rows of the Gram matrix are independent. BLAS++ dispatches each
+    // GEMM to the configured host BLAS; batch tasks also use host threads
+    // when that BLAS is sequential (as in the default MKL configuration).
+    parallel_shell_tasks("isdf_metric_gram_batches", batches, [&](std::size_t task) {
+        const auto first = task*batch_size;
+        const auto rows = std::min(batch_size, nvec-first);
+        blas::gemm(blas::Layout::RowMajor, blas::Op::NoTrans, blas::Op::Trans,
+                   static_cast<int64_t>(rows), static_cast<int64_t>(nvec),
+                   static_cast<int64_t>(rank), 1.0, projection.data()+first*rank,
+                   static_cast<int64_t>(rank), projection.data(),
+                   static_cast<int64_t>(rank), 0.0, metric.data()+first*nvec,
+                   static_cast<int64_t>(nvec));
+    });
+    if (debug)
+        std::cerr << "[cholesky ao] metric_gemm_seconds="
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now()-projection_finished).count()
+                  << std::endl;
     return metric;
 }
 }
