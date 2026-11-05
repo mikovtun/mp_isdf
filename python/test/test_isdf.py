@@ -141,10 +141,21 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertIn("J ISDF vs PySCF", output.getvalue())
         self.assertIn("K ISDF vs PySCF", output.getvalue())
         output = io.StringIO()
+        with patch.object(sys, "argv", args + ["--derivative-target", "0000",
+                                               "--compare"]), redirect_stdout(output), \
+             patch.object(scf.hf, "get_jk", side_effect=AssertionError(
+                 "explicit 0000 comparison must use full ERIs")):
+            main()
+        self.assertIn("PySCF target 0000", output.getvalue())
+        self.assertNotIn("ISDF vs PySCF", output.getvalue())
+        output = io.StringIO()
         with patch.object(sys, "argv", args + ["--derivative-target", "00zz",
-                                               "--compare"]), redirect_stdout(output):
+                                               "--compare"]), redirect_stdout(output), \
+             patch.object(scf.hf, "get_jk", side_effect=AssertionError(
+                 "derivative comparison must not compute PySCF J/K")):
             main()
         self.assertIn("PySCF target 00zz", output.getvalue())
+        self.assertNotIn("ISDF vs PySCF", output.getvalue())
         output = io.StringIO()
         with patch.object(sys, "argv", args + ["--no-metric", "--derivative-target", "00zz"]), \
              redirect_stdout(output), \
@@ -168,6 +179,11 @@ class TestMinimalISDF(unittest.TestCase):
                                   metric_algorithm=algorithm)
             np.testing.assert_allclose(result["coulomb_metric"], baseline["coulomb_metric"])
             self.assertEqual(result["derivative_integrals"], {})
+            self.assertEqual(set(result["target_factors"]), {"0000"})
+            ordinary = result["target_factors"]["0000"]
+            for slot in ("X1", "X2", "X3", "X4"):
+                np.testing.assert_allclose(ordinary[slot], result["X1"])
+            np.testing.assert_allclose(ordinary["coulomb_metric"], result["coulomb_metric"])
             self.assertNotIn("derivative_integrals", result["timings"])
         np.testing.assert_allclose(_reference_target(self.mol, "0000"),
                                    self.mol.intor("int2e", aosym="s1"))
@@ -197,14 +213,26 @@ class TestMinimalISDF(unittest.TestCase):
                                 derivative_targets=("00zz", "z00z"))
             self.assertIsNotNone(result["coulomb_metric"])
             self.assertEqual(set(result["derivative_integrals"]), {"00zz", "z00z"})
-            for integral in result["derivative_integrals"].values():
+            self.assertEqual(set(result["target_factors"]), {"00zz", "z00z"})
+            anchor_grad_z = ctx.eval_ao_gradient(result["anchor_coords"])[2]
+            for target, integral in result["derivative_integrals"].items():
+                factors = result["target_factors"][target]
                 self.assertEqual(integral.shape, (mol.nao_nr(),)*4)
                 self.assertTrue(np.isfinite(integral).all())
+                for slot, label in zip(("X1", "X2", "X3", "X4"), target):
+                    expected = result["X1"] if label == "0" else anchor_grad_z
+                    np.testing.assert_allclose(factors[slot], expected)
+                np.testing.assert_allclose(
+                    np.einsum("pu,pv,pq,qw,qx->uvwx", factors["X1"], factors["X2"],
+                              factors["coulomb_metric"], factors["X3"], factors["X4"],
+                              optimize=True), integral, atol=1e-10)
             self.assertIn("derivative_integrals", result["timings"])
         with self.assertRaisesRegex(ValueError, "two derivatives"):
             build_isdf(mol, derivative_targets=("x000",))
-        with self.assertRaisesRegex(ValueError, "max_derivative_bytes"):
-            build_isdf(mol, derivative_targets=("00zz",), max_derivative_bytes=1)
+        exact_fit = build_isdf(self.mol, level=0, anchor_rank=3,
+                               derivative_targets=("00zz",))
+        np.testing.assert_allclose(exact_fit["derivative_integrals"]["00zz"],
+                                   _reference_target(self.mol, "00zz"), atol=1e-10)
 
     def test_host_space_driver(self):
         result = build_isdf(self.mol, level=0, anchor_rank=2,
@@ -223,12 +251,14 @@ class TestMinimalISDF(unittest.TestCase):
                                  compute_metric=False, derivative_targets=("0000", "00zz"))
         self.assertIsNone(skipped["coulomb_metric"])
         self.assertEqual(skipped["derivative_integrals"], {})
+        self.assertEqual(skipped["target_factors"], {})
         with patch.object(mp_isdf.LibcintContext, "eval_ao",
                           side_effect=AssertionError("selection only must skip AO fit")):
             selected = build_isdf(self.mol, level=0, anchor_rank=2,
                                   compute_metric=False, derivative_targets=("00zz",),
                                   selection_only=True)
         self.assertIsNone(selected["interp_vecs"])
+        self.assertEqual(selected["target_factors"], {})
         self.assertIsNone(selected["overlap_relative_error"])
         self.assertEqual(list(selected["timings"]), ["grid", "context", "anchor_selection"])
 

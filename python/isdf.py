@@ -143,8 +143,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
-               derivative_targets=(), max_derivative_bytes=1 << 30,
-               selection_only=False):
+               derivative_targets=(), selection_only=False):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -157,10 +156,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     diagonal); `"grid"` uses the spherical-cell grid approximation instead.
     `derivative_targets` lists four-slot strings such as '00xy' and 'x00y',
     or 'all' for all 54 two-derivative spatial ERIs. '0000' selects the
-    ordinary AO ISDF path and does not request an additional ERI tensor. The four slots are (u,v,w,x);
+    ordinary AO ISDF path; with `--compare` it compares the full scalar ERI.
+    The four slots are (u,v,w,x);
     'x', 'y', 'z' mean electronic-coordinate first derivatives on individual
     AOs, not nuclear derivatives or assembled spinor integrals. Derivative
     channels are fitted separately from `axes` on the selected anchors.
+    `target_factors[target]` exposes the four target-specific anchor matrices
+    X1..X4 and their anchor-weighted cross Coulomb metric. The top-level
+    X1..X4 and `coulomb_metric` always describe ordinary AO ISDF.
     `compute_metric=False` skips both scalar and derivative metrics.
     `selection_only=True` returns immediately after anchor selection (and
     requires compute_metric=False). `report_timings` prints completed stages
@@ -203,6 +206,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     for target in derivative_targets:
         _target_labels(target)
     # The scalar channel already belongs to the ordinary ISDF result.
+    scalar_target_requested = "0000" in derivative_targets
     derivative_targets = tuple(t for t in derivative_targets if t != "0000")
 
     grids = dft.gen_grid.Grids(mol)
@@ -245,6 +249,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             "overlap_relative_error": None,
             "coulomb_metric": None,
             "derivative_integrals": {},
+            "target_factors": {},
             "X1": None, "X2": None, "X3": None, "X4": None,
             "elapsed": last - started,
             "timings": timings,
@@ -299,9 +304,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             print("  coulomb_metric     skipped", flush=True)
 
     derivative_integrals = {}
+    target_factors = {}
+    if metric is not None and scalar_target_requested:
+        target_factors["0000"] = {
+            "X1": anchor_ao, "X2": anchor_ao,
+            "X3": anchor_ao, "X4": anchor_ao,
+            "coulomb_metric": metric,
+        }
     if compute_metric and derivative_targets:
-        if max_derivative_bytes < len(derivative_targets) * nao**4 * np.dtype(np.float64).itemsize:
-            raise ValueError("requested derivative ERI tensors exceed max_derivative_bytes")
         gradient = context.eval_ao_gradient(coords, space=space)
         anchor_gradient = context.eval_ao_gradient(anchor_coords, space=space)
         fields = {"0": ao, **dict(zip("xyz", gradient))}
@@ -340,6 +350,13 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                         tolerance=metric_tol, max_rank=metric_rank,
                     )
                 cross_metrics[pair] = anchor_weights[:, None] * raw * anchor_weights[None, :]
+            target_factors[target] = {
+                "X1": anchor_fields[left_label[0]],
+                "X2": anchor_fields[left_label[1]],
+                "X3": anchor_fields[right_label[0]],
+                "X4": anchor_fields[right_label[1]],
+                "coulomb_metric": cross_metrics[pair],
+            }
             derivative_integrals[target] = (left_pairs.T @ cross_metrics[pair] @ right_pairs
                                             ).reshape(nao, nao, nao, nao)
             if report_timings:
@@ -357,6 +374,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         "overlap_relative_error": overlap_relative_error,
         "coulomb_metric": metric,
         "derivative_integrals": derivative_integrals,
+        "target_factors": target_factors,
         "X1": anchor_ao, "X2": anchor_ao, "X3": anchor_ao, "X4": anchor_ao,
         "elapsed": last - started,
         "timings": timings,
@@ -409,12 +427,11 @@ def main():
     parser.add_argument("--derivative-target", action="append", default=[],
                         help="ERI slots (0000 for ordinary AOs; e.g. 00xy or x00y for derivatives); "
                              "repeat, or use 'all' for two derivatives")
-    parser.add_argument("--max-derivative-gib", type=float, default=1.0,
-                        help="memory limit for derivative tensors or one exact PySCF tensor")
     parser.add_argument("--no-metric", action="store_true",
                         help="skip scalar and derivative metrics; keep the AO fit and overlap check")
     parser.add_argument("--compare", action="store_true",
-                        help="evaluate ISDF J/K and compare with exact PySCF J/K (can be expensive)")
+                        help="compare full four-index ERIs for explicit targets; "
+                             "otherwise compare ISDF J/K with PySCF")
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
@@ -428,8 +445,6 @@ def main():
         parser.error("--metric-rank must be nonnegative")
     if args.compare and args.no_metric:
         parser.error("--compare requires a metric (omit --no-metric)")
-    if not np.isfinite(args.max_derivative_gib) or args.max_derivative_gib <= 0:
-        parser.error("--max-derivative-gib must be finite and positive")
     atom = _read_xyz(args.molecule) if args.molecule else "H 0 0 0; H 0 0 0.74"
     mol = gto.M(atom=atom, basis=args.basis, unit="Angstrom", verbose=0)
     axes = [axis.strip().lower() for axis in args.axes.split(",")]
@@ -444,7 +459,6 @@ def main():
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         derivative_targets=args.derivative_target,
-                        max_derivative_bytes=int(args.max_derivative_gib * (1 << 30)),
                         report_timings=True)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
@@ -458,7 +472,7 @@ def main():
     print(f"ISDF build time: {result['elapsed']:.6f} s")
     if result["derivative_integrals"]:
         print(f"Derivative ERI targets: {', '.join(result['derivative_integrals'])}")
-    if args.compare and result["coulomb_metric"] is not None:
+    if args.compare and not args.derivative_target:
         started = time.perf_counter()
         if mf is not None:
             dm = mf.make_rdm1()
@@ -482,20 +496,22 @@ def main():
             relative = error / max(np.linalg.norm(exact), 1e-30)
             print(f"{label} ISDF vs PySCF: absolute Frobenius error {error:.3e}; "
                   f"relative error {relative:.3e}")
-    if args.compare and result["derivative_integrals"]:
-        nbytes = 9 * mol.nao_nr()**4 * np.dtype(np.float64).itemsize
-        if nbytes > int(args.max_derivative_gib * (1 << 30)):
-            print("Skipping derivative PySCF comparison: exact tensor exceeds "
-                  "--max-derivative-gib", flush=True)
-        else:
-            exact_cache = {}
-            for target, approximate in result["derivative_integrals"].items():
-                started = time.perf_counter()
-                exact = _reference_target(mol, target, exact_cache)
-                error = np.linalg.norm(approximate - exact)
-                relative = error / max(np.linalg.norm(exact), 1e-30)
-                print(f"  PySCF target {target} {time.perf_counter() - started:.6f} s; "
-                      f"absolute error {error:.3e}; relative error {relative:.3e}", flush=True)
+    if args.compare and args.derivative_target:
+        targets = dict(result["derivative_integrals"])
+        if "0000" in args.derivative_target:
+            x = result["X1"]
+            pairs = (x[:, :, None] * x[:, None, :]).reshape(len(x), -1)
+            nao = mol.nao_nr()
+            targets["0000"] = (pairs.T @ result["coulomb_metric"] @ pairs
+                               ).reshape(nao, nao, nao, nao)
+        exact_cache = {}
+        for target, approximate in targets.items():
+            started = time.perf_counter()
+            exact = _reference_target(mol, target, exact_cache)
+            error = np.linalg.norm(approximate - exact)
+            relative = error / max(np.linalg.norm(exact), 1e-30)
+            print(f"  PySCF target {target} {time.perf_counter() - started:.6f} s; "
+                  f"absolute error {error:.3e}; relative error {relative:.3e}", flush=True)
 
 
 if __name__ == "__main__":
