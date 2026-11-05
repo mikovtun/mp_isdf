@@ -55,6 +55,19 @@ class TestCoulombMetric(unittest.TestCase):
     def test_p_shell(self):
         self.check_molecule(gto.M(atom='He 0 0 0', basis='cc-pvdz', verbose=0))
 
+    def test_parallel_derivative_shell_quartets(self):
+        # cc-pVDZ has multiple s and p shells: both channels have enough
+        # ordered shell-pair tasks to run the parallel host path.
+        mol = gto.M(atom='He 0 0 0', basis='cc-pvdz', verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        nao = mol.nao_nr()
+        identity = np.eye(nao * nao)
+        actual = mp_isdf.derivative_cross_metric(
+            ctx, identity, (0, 0), identity, (3, 3), tolerance=1e-12)
+        expected = (mol.intor('int2e_ipvip1', comp=9, aosym='s1')[8]
+                    .transpose(2, 3, 0, 1).reshape(nao*nao, nao*nao))
+        np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
     def test_driver_uses_ao_coefficients_and_anchor_weights(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='sto-3g', verbose=0)
         result = build_isdf(mol, level=0, anchor_rank=3)

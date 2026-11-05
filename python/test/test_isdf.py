@@ -3,6 +3,8 @@
 from pathlib import Path
 from contextlib import redirect_stdout
 import io
+import os
+import subprocess
 import sys
 import unittest
 
@@ -80,6 +82,25 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertEqual(len(lines), len(result["timings"]))
         self.assertIn("grid", lines[0])
         self.assertIn("coulomb_metric", lines[-1])
+
+    def test_debug_cholesky_and_deferred_timings(self):
+        command = [sys.executable, str(Path(__file__).resolve().parents[1] / "isdf.py"),
+                   "--anchor-rank", "3", "--metric-rank", "2",
+                   "--derivative-target", "00zz", "--debug", "--compare",
+                   "--space", "host"]
+        environment = {**os.environ, "OMP_NUM_THREADS": "2", "OMP_PROC_BIND": "false",
+                       "OPENBLAS_NUM_THREADS": "1"}
+        completed = subprocess.run(command, check=True, capture_output=True, text=True,
+                                   env=environment, timeout=60)
+        for text in ("[cholesky ao] rank=1", "[cholesky derivative] rank=1",
+                     "column_quartets=", "max_remaining=", "reason=rank_limit"):
+            self.assertIn(text, completed.stderr)
+        self.assertIn("Timing report:", completed.stdout)
+        self.assertLess(completed.stdout.index("PySCF target 00zz:"),
+                        completed.stdout.index("Timing report:"))
+        self.assertIn("pyscf_target_00zz", completed.stdout)
+        self.assertTrue(completed.stdout.rstrip().splitlines()[-1].strip().startswith(
+            "Runner total"))
 
     def test_grid_cross_metric(self):
         coords = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])

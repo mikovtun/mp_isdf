@@ -1,7 +1,10 @@
 #include "derivative_metric.hpp"
+#include "parallel_shell_tasks.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -96,7 +99,7 @@ std::size_t value_index(const Kernel& kernel, std::array<std::size_t,4> dims,
 std::vector<double> derivative_cross_metric(
     const LibcintContext& ctx, const std::vector<double>& left, std::size_t nleft,
     Basis left_basis, const std::vector<double>& right, std::size_t nright,
-    Basis right_basis, double tolerance, std::size_t max_rank)
+    Basis right_basis, double tolerance, std::size_t max_rank, bool debug)
 {
     if (!std::isfinite(tolerance) || tolerance < 0)
         throw std::invalid_argument("Cholesky tolerance must be finite and nonnegative");
@@ -126,24 +129,41 @@ std::vector<double> derivative_cross_metric(
     if (shells.back().offset+shells.back().size!=nao)
         throw std::runtime_error("AO and libcint shell ordering mismatch");
     const auto& tables=ctx.tables();
+    const auto nshells=shells.size();
+    const auto shell_pair_count=nshells*nshells;
     std::vector<double> diagonal(dimension,0.0);
-    for (int channel=0;channel<2;++channel)
-        for (const auto& a:shells) for (const auto& b:shells) {
-            const auto dims=std::array<std::size_t,4>{a.size,b.size,a.size,b.size};
-            const auto block=quartet(tables,kernels[channel][channel],
-                                     {a.id,b.id,a.id,b.id},dims);
-            for (std::size_t i=0;i<a.size;++i) for (std::size_t j=0;j<b.size;++j) {
-                const auto value=block[value_index(kernels[channel][channel],dims,{i,j,i,j})];
-                if (!std::isfinite(value) || value < -1e-10)
-                    throw std::runtime_error("invalid derivative ERI diagonal");
-                diagonal[channel*npair+(a.offset+i)*nao+b.offset+j]=std::max(0.0,value);
-            }
+    const auto diagonal_started=std::chrono::steady_clock::now();
+    parallel_shell_tasks("isdf_derivative_eri_diagonal", 2*shell_pair_count,
+                         [&](std::size_t task) {
+        const auto channel=task/shell_pair_count;
+        const auto& a=shells[(task%shell_pair_count)/nshells];
+        const auto& b=shells[task%nshells];
+        const auto dims=std::array<std::size_t,4>{a.size,b.size,a.size,b.size};
+        const auto block=quartet(tables,kernels[channel][channel],
+                                 {a.id,b.id,a.id,b.id},dims);
+        for (std::size_t i=0;i<a.size;++i) for (std::size_t j=0;j<b.size;++j) {
+            const auto value=block[value_index(kernels[channel][channel],dims,{i,j,i,j})];
+            if (!std::isfinite(value) || value < -1e-10)
+                throw std::runtime_error("invalid derivative ERI diagonal");
+            diagonal[channel*npair+(a.offset+i)*nao+b.offset+j]=std::max(0.0,value);
         }
+    });
     const auto initial=*std::max_element(diagonal.begin(),diagonal.end());
     const double cutoff=tolerance*initial;
     std::vector<double> factors; // [pivot, joint ordered pair]
     std::vector<std::size_t> pivots;
     const auto cap=max_rank?max_rank:dimension;
+    if (debug) {
+        const auto seconds=std::chrono::duration<double>(
+            std::chrono::steady_clock::now()-diagonal_started).count();
+        std::cerr << "[cholesky derivative] channels=("
+                  << left_basis[0] << left_basis[1] << ','
+                  << right_basis[0] << right_basis[1] << ") shells=" << nshells
+                  << " pairs=" << dimension
+                  << " diagonal_quartets=" << 2*shell_pair_count
+                  << " initial_max_residual=" << initial << " cutoff=" << cutoff
+                  << " diagonal_seconds=" << seconds << std::endl;
+    }
     while (pivots.size()<cap) {
         const auto it=std::max_element(diagonal.begin(),diagonal.end());
         const double pivot_value=*it;
@@ -154,15 +174,20 @@ std::vector<double> derivative_cross_metric(
         const auto& a=shells[ao_shell[mu]];
         const auto& b=shells[ao_shell[nu]];
         std::vector<double> column(dimension,0.0);
-        for (int channel=0;channel<2;++channel)
-            for (const auto& c:shells) for (const auto& d:shells) {
-                const auto dims=std::array<std::size_t,4>{c.size,d.size,a.size,b.size};
-                const auto& kernel=kernels[channel][pivot_channel];
-                const auto block=quartet(tables,kernel,{c.id,d.id,a.id,b.id},dims);
-                for (std::size_t i=0;i<c.size;++i) for (std::size_t j=0;j<d.size;++j)
-                    column[channel*npair+(c.offset+i)*nao+d.offset+j]=
-                        block[value_index(kernel,dims,{i,j,mu-a.offset,nu-b.offset})];
-            }
+        const auto column_started=std::chrono::steady_clock::now();
+        parallel_shell_tasks("isdf_derivative_eri_pivot_column", 2*shell_pair_count,
+                             [&](std::size_t task) {
+            const auto channel=task/shell_pair_count;
+            const auto& c=shells[(task%shell_pair_count)/nshells];
+            const auto& d=shells[task%nshells];
+            const auto dims=std::array<std::size_t,4>{c.size,d.size,a.size,b.size};
+            const auto& kernel=kernels[channel][pivot_channel];
+            const auto block=quartet(tables,kernel,{c.id,d.id,a.id,b.id},dims);
+            for (std::size_t i=0;i<c.size;++i) for (std::size_t j=0;j<d.size;++j)
+                column[channel*npair+(c.offset+i)*nao+d.offset+j]=
+                    block[value_index(kernel,dims,{i,j,mu-a.offset,nu-b.offset})];
+        });
+        const auto column_finished=std::chrono::steady_clock::now();
         const auto rank=pivots.size();
         const auto denom=std::sqrt(pivot_value);
         for (std::size_t p=0;p<dimension;++p) {
@@ -179,6 +204,27 @@ std::vector<double> derivative_cross_metric(
         for (std::size_t p=0;p<dimension;++p)
             diagonal[p]=std::max(0.0,diagonal[p]-column[p]*column[p]);
         diagonal[pivot]=0.0;
+        if (debug) {
+            const auto next=*std::max_element(diagonal.begin(),diagonal.end());
+            const auto integral_seconds=std::chrono::duration<double>(
+                column_finished-column_started).count();
+            const auto update_seconds=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-column_finished).count();
+            std::cerr << "[cholesky derivative] rank=" << pivots.size()
+                      << " channel=" << pivot_channel << " pivot=(" << mu << ',' << nu
+                      << ") shell_pair=(" << a.id << ',' << b.id << ") pivot_residual="
+                      << pivot_value << " max_remaining=" << next
+                      << " column_quartets=" << 2*shell_pair_count
+                      << " integral_seconds=" << integral_seconds
+                      << " update_seconds=" << update_seconds << std::endl;
+        }
+    }
+    if (debug) {
+        const auto remaining=*std::max_element(diagonal.begin(),diagonal.end());
+        std::cerr << "[cholesky derivative] stop rank=" << pivots.size()
+                  << " max_remaining=" << remaining
+                  << " reason=" << (remaining==0.0 ? "zero_residual" :
+                      remaining<=cutoff ? "tolerance" : "rank_limit") << std::endl;
     }
     const auto rank=pivots.size();
     if (rank && (nleft > std::numeric_limits<std::size_t>::max()/rank ||

@@ -12,5 +12,5 @@ std::vector<double> derivative_cross_metric(
     const LibcintContext& context,
     const std::vector<double>& left, std::size_t nleft, std::array<int,2> left_basis,
     const std::vector<double>& right, std::size_t nright, std::array<int,2> right_basis,
-    double tolerance, std::size_t max_rank);
+    double tolerance, std::size_t max_rank, bool debug = false);
 }

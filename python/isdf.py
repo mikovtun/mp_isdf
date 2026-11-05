@@ -143,7 +143,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
-               derivative_targets=(), selection_only=False):
+               derivative_targets=(), selection_only=False, debug=False):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -166,8 +166,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     X1..X4 and `coulomb_metric` always describe ordinary AO ISDF.
     `compute_metric=False` skips both scalar and derivative metrics.
     `selection_only=True` returns immediately after anchor selection (and
-    requires compute_metric=False). `report_timings` prints completed stages
-    immediately; timings are also returned in the result.
+    requires compute_metric=False). `debug` logs greedy Cholesky pivots and
+    suppresses live timing output; timings remain available in the result.
+    Otherwise `report_timings` prints completed stages immediately.
     """
     started = time.perf_counter()
     last = started
@@ -178,7 +179,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         now = time.perf_counter()
         timings[stage] = now - last
         last = now
-        if report_timings:
+        if report_timings and not debug:
             print(f"  {stage:18s} {timings[stage]:10.6f} s  "
                   f"(elapsed {last - started:.6f} s)", flush=True)
 
@@ -290,7 +291,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             raw = mp_isdf.coulomb_metric(
                 context, transform, algorithm=metric_algorithm,
                 tolerance=metric_tol, max_rank=metric_rank,
-                batch_size=metric_batch_size,
+                batch_size=metric_batch_size, debug=debug,
             )
         return anchor_weights[:, None] * raw * anchor_weights[None, :]
 
@@ -300,7 +301,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         record("coulomb_metric")
     else:
         timings["coulomb_metric"] = 0.0
-        if report_timings:
+        if report_timings and not debug:
             print("  coulomb_metric     skipped", flush=True)
 
     derivative_integrals = {}
@@ -344,10 +345,12 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                     raw = grid_cross_metric(left_theta, right_theta, coords, weights)
                 else:
                     labels = {"0": 0, "x": 1, "y": 2, "z": 3}
+                    if debug:
+                        print(f"[cholesky target {target}]", file=sys.stderr, flush=True)
                     raw = mp_isdf.derivative_cross_metric(
                         context, left_coeff, tuple(labels[c] for c in left_label),
                         right_coeff, tuple(labels[c] for c in right_label),
-                        tolerance=metric_tol, max_rank=metric_rank,
+                        tolerance=metric_tol, max_rank=metric_rank, debug=debug,
                     )
                 cross_metrics[pair] = anchor_weights[:, None] * raw * anchor_weights[None, :]
             target_factors[target] = {
@@ -359,7 +362,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             }
             derivative_integrals[target] = (left_pairs.T @ cross_metrics[pair] @ right_pairs
                                             ).reshape(nao, nao, nao, nao)
-            if report_timings:
+            if report_timings and not debug:
                 print(f"    target {target:<4s} {time.perf_counter()-target_started:10.6f} s",
                       flush=True)
         record("derivative_integrals")
@@ -432,6 +435,8 @@ def main():
     parser.add_argument("--compare", action="store_true",
                         help="compare full four-index ERIs for explicit targets; "
                              "otherwise compare ISDF J/K with PySCF")
+    parser.add_argument("--debug", action="store_true",
+                        help="log each greedy Cholesky pivot and print timings at the end")
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
@@ -445,6 +450,8 @@ def main():
         parser.error("--metric-rank must be nonnegative")
     if args.compare and args.no_metric:
         parser.error("--compare requires a metric (omit --no-metric)")
+    runner_started = time.perf_counter()
+    comparison_timings = []
     atom = _read_xyz(args.molecule) if args.molecule else "H 0 0 0; H 0 0 0.74"
     mol = gto.M(atom=atom, basis=args.basis, unit="Angstrom", verbose=0)
     axes = [axis.strip().lower() for axis in args.axes.split(",")]
@@ -459,7 +466,7 @@ def main():
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         derivative_targets=args.derivative_target,
-                        report_timings=True)
+                        report_timings=not args.debug, debug=args.debug)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
     if args.anchor_rank and len(result["anchor_indices"]) == args.anchor_rank:
@@ -469,7 +476,8 @@ def main():
         print(f"Overlap reconstruction relative error: {result['overlap_relative_error']:.3e}")
     if result["coulomb_metric"] is not None:
         print("Coulomb metric shape:", result["coulomb_metric"].shape)
-    print(f"ISDF build time: {result['elapsed']:.6f} s")
+    if not args.debug:
+        print(f"ISDF build time: {result['elapsed']:.6f} s")
     if result["derivative_integrals"]:
         print(f"Derivative ERI targets: {', '.join(result['derivative_integrals'])}")
     if args.compare and not args.derivative_target:
@@ -480,16 +488,25 @@ def main():
         else:
             dm = scf.hf.init_guess_by_minao(mol)
             density_source = "PySCF MINAO initial guess"
-        print(f"  density_matrix       {time.perf_counter() - started:10.6f} s "
-              f"({density_source})", flush=True)
+        seconds = time.perf_counter() - started
+        comparison_timings.append(("density_matrix", seconds))
+        if not args.debug:
+            print(f"  density_matrix       {seconds:10.6f} s "
+                  f"({density_source})", flush=True)
 
         started = time.perf_counter()
         j_isdf, k_isdf = evaluate_isdf_jk(result, dm)
-        print(f"  isdf_jk              {time.perf_counter() - started:10.6f} s", flush=True)
+        seconds = time.perf_counter() - started
+        comparison_timings.append(("isdf_jk", seconds))
+        if not args.debug:
+            print(f"  isdf_jk              {seconds:10.6f} s", flush=True)
 
         started = time.perf_counter()
         j_exact, k_exact = scf.hf.get_jk(mol, dm)
-        print(f"  pyscf_jk             {time.perf_counter() - started:10.6f} s", flush=True)
+        seconds = time.perf_counter() - started
+        comparison_timings.append(("pyscf_jk", seconds))
+        if not args.debug:
+            print(f"  pyscf_jk             {seconds:10.6f} s", flush=True)
         for label, approximate, exact in (("J", j_isdf, j_exact),
                                           ("K", k_isdf, k_exact)):
             error = np.linalg.norm(approximate - exact)
@@ -510,8 +527,23 @@ def main():
             exact = _reference_target(mol, target, exact_cache)
             error = np.linalg.norm(approximate - exact)
             relative = error / max(np.linalg.norm(exact), 1e-30)
-            print(f"  PySCF target {target} {time.perf_counter() - started:.6f} s; "
-                  f"absolute error {error:.3e}; relative error {relative:.3e}", flush=True)
+            seconds = time.perf_counter() - started
+            comparison_timings.append((f"pyscf_target_{target}", seconds))
+            if args.debug:
+                print(f"  PySCF target {target}: absolute error {error:.3e}; "
+                      f"relative error {relative:.3e}", flush=True)
+            else:
+                print(f"  PySCF target {target} {seconds:.6f} s; "
+                      f"absolute error {error:.3e}; relative error {relative:.3e}", flush=True)
+    if args.debug:
+        print("Timing report:")
+        for stage, seconds in result["timings"].items():
+            fraction = 100 * seconds / result["elapsed"] if result["elapsed"] else 0.0
+            print(f"  {stage:22s} {seconds:10.6f} s  ({fraction:5.1f}% of build)")
+        print(f"  ISDF build total       {result['elapsed']:10.6f} s")
+        for stage, seconds in comparison_timings:
+            print(f"  {stage:22s} {seconds:10.6f} s")
+        print(f"  Runner total           {time.perf_counter()-runner_started:10.6f} s")
 
 
 if __name__ == "__main__":

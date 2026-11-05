@@ -1,10 +1,14 @@
 #include "coulomb_metric.hpp"
+#include "parallel_shell_tasks.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace isdf {
@@ -43,7 +47,8 @@ std::vector<double> quartet(const LibcintWrapper& tables,
 }
 }
 
-ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_t max_rank)
+ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance,
+                         std::size_t max_rank, bool debug)
 {
     if (!std::isfinite(tolerance) || tolerance < 0)
         throw std::invalid_argument("Cholesky tolerance must be finite and nonnegative");
@@ -54,6 +59,10 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_
     if (npair == 0) throw std::invalid_argument("empty AO basis");
     if (max_rank > npair) throw std::invalid_argument("max_rank exceeds AO-pair dimension");
     const auto shells = shells_for(ctx);
+    std::vector<std::pair<std::size_t, std::size_t>> shell_pairs;
+    for (std::size_t s = 0; s < shells.size(); ++s)
+        for (std::size_t t = 0; t <= s; ++t)
+            shell_pairs.emplace_back(s, t);
     const auto& tables = ctx.tables();
     ERICholesky result;
     result.npair = npair;
@@ -64,26 +73,34 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_
             ao_shell[a] = s;
 
     // Only (mu nu | mu nu) is retained from each diagonal shell quartet.
-    for (std::size_t s = 0; s < shells.size(); ++s) {
+    const auto diagonal_started = std::chrono::steady_clock::now();
+    parallel_shell_tasks("isdf_eri_diagonal", shell_pairs.size(), [&](std::size_t task) {
+        const auto [s, t] = shell_pairs[task];
         const auto& a = shells[s];
-        for (std::size_t t = 0; t <= s; ++t) {
-            const auto& b = shells[t];
-            const auto block = quartet(tables, {a.id,b.id,a.id,b.id},
-                                       {a.size,b.size,a.size,b.size});
-            for (std::size_t i = 0; i < a.size; ++i)
-                for (std::size_t j = 0; j < b.size; ++j) {
-                    const auto mu = a.offset+i, nu = b.offset+j;
-                    if (mu < nu) continue;
-                    const auto value = block[i + a.size*(j + b.size*(i + a.size*j))];
-                    if (!std::isfinite(value) || value < -1e-12)
-                        throw std::runtime_error("invalid ERI diagonal");
-                    result.residual[pair_index(mu,nu)] = std::max(0.0, value);
-                }
-        }
-    }
+        const auto& b = shells[t];
+        const auto block = quartet(tables, {a.id,b.id,a.id,b.id},
+                                   {a.size,b.size,a.size,b.size});
+        for (std::size_t i = 0; i < a.size; ++i)
+            for (std::size_t j = 0; j < b.size; ++j) {
+                const auto mu = a.offset+i, nu = b.offset+j;
+                if (mu < nu) continue;
+                const auto value = block[i + a.size*(j + b.size*(i + a.size*j))];
+                if (!std::isfinite(value) || value < -1e-12)
+                    throw std::runtime_error("invalid ERI diagonal");
+                result.residual[pair_index(mu,nu)] = std::max(0.0, value);
+            }
+    });
     const double initial = *std::max_element(result.residual.begin(), result.residual.end());
     const double cutoff = tolerance * initial;
     const std::size_t cap = max_rank ? max_rank : npair;
+    if (debug) {
+        const auto seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - diagonal_started).count();
+        std::cerr << "[cholesky ao] shells=" << shells.size() << " pairs=" << npair
+                  << " diagonal_quartets=" << shell_pairs.size()
+                  << " initial_max_residual=" << initial << " cutoff=" << cutoff
+                  << " diagonal_seconds=" << seconds << std::endl;
+    }
     while (result.pivots.size() < cap) {
         const auto it = std::max_element(result.residual.begin(), result.residual.end());
         const double maximum = *it;
@@ -99,22 +116,24 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_
         const auto& a = shells[ao_shell[mu]];
         const auto& b = shells[ao_shell[nu]];
         std::vector<double> column(npair, 0.0);
-        for (std::size_t s = 0; s < shells.size(); ++s) {
+        const auto column_started = std::chrono::steady_clock::now();
+        parallel_shell_tasks("isdf_eri_pivot_column", shell_pairs.size(),
+                             [&](std::size_t task) {
+            const auto [s, t] = shell_pairs[task];
             const auto& c = shells[s];
-            for (std::size_t t = 0; t <= s; ++t) {
-                const auto& d = shells[t];
-                const auto block = quartet(tables, {c.id,d.id,a.id,b.id},
-                                           {c.size,d.size,a.size,b.size});
-                const auto ai = mu-a.offset, bi = nu-b.offset;
-                for (std::size_t i = 0; i < c.size; ++i)
-                    for (std::size_t j = 0; j < d.size; ++j) {
-                        const auto x = c.offset+i, y = d.offset+j;
-                        if (x < y) continue;
-                        column[pair_index(x,y)] =
-                            block[i + c.size*(j + d.size*(ai + a.size*bi))];
-                    }
-            }
-        }
+            const auto& d = shells[t];
+            const auto block = quartet(tables, {c.id,d.id,a.id,b.id},
+                                       {c.size,d.size,a.size,b.size});
+            const auto ai = mu-a.offset, bi = nu-b.offset;
+            for (std::size_t i = 0; i < c.size; ++i)
+                for (std::size_t j = 0; j < d.size; ++j) {
+                    const auto x = c.offset+i, y = d.offset+j;
+                    if (x < y) continue;
+                    column[pair_index(x,y)] =
+                        block[i + c.size*(j + d.size*(ai + a.size*bi))];
+                }
+        });
+        const auto column_finished = std::chrono::steady_clock::now();
         const auto rank = result.pivots.size();
         const double denom = std::sqrt(maximum);
         for (std::size_t p = 0; p < npair; ++p) {
@@ -131,6 +150,27 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_
         for (std::size_t p = 0; p < npair; ++p)
             result.residual[p] = std::max(0.0, result.residual[p] - column[p]*column[p]);
         result.residual[pivot] = 0.0;
+        if (debug) {
+            const auto next = *std::max_element(result.residual.begin(), result.residual.end());
+            const auto integral_seconds = std::chrono::duration<double>(
+                column_finished - column_started).count();
+            const auto update_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - column_finished).count();
+            std::cerr << "[cholesky ao] rank=" << result.pivots.size()
+                      << " pivot=(" << mu << ',' << nu << ") shell_pair=("
+                      << a.id << ',' << b.id << ") pivot_residual=" << maximum
+                      << " max_remaining=" << next
+                      << " column_quartets=" << shell_pairs.size()
+                      << " integral_seconds=" << integral_seconds
+                      << " update_seconds=" << update_seconds << std::endl;
+        }
+    }
+    if (debug) {
+        const auto remaining = *std::max_element(result.residual.begin(), result.residual.end());
+        std::cerr << "[cholesky ao] stop rank=" << result.pivots.size()
+                  << " max_remaining=" << remaining
+                  << " reason=" << (remaining == 0.0 ? "zero_residual" :
+                      remaining <= cutoff ? "tolerance" : "rank_limit") << std::endl;
     }
     return result;
 }
@@ -138,7 +178,8 @@ ERICholesky cholesky_eri(const LibcintContext& ctx, double tolerance, std::size_
 std::vector<double> coulomb_metric(const LibcintContext& ctx,
                                    const std::vector<double>& transform,
                                    std::size_t nvec, double tolerance,
-                                   std::size_t max_rank, std::size_t batch_size)
+                                   std::size_t max_rank, std::size_t batch_size,
+                                   bool debug)
 {
     const auto nao = ctx.nao();
     if (!batch_size) throw std::invalid_argument("batch_size must be positive");
@@ -148,7 +189,7 @@ std::vector<double> coulomb_metric(const LibcintContext& ctx,
         throw std::invalid_argument("expected transform[nvec,nao*nao]");
     for (double value : transform)
         if (!std::isfinite(value)) throw std::invalid_argument("transform must be finite");
-    const auto decomposition = cholesky_eri(ctx, tolerance, max_rank);
+    const auto decomposition = cholesky_eri(ctx, tolerance, max_rank, debug);
     const auto npair = decomposition.npair, rank = decomposition.pivots.size();
     if (nvec && nvec > std::numeric_limits<std::size_t>::max()/nvec)
         throw std::overflow_error("metric dimensions overflow size_t");
