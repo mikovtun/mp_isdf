@@ -1,5 +1,5 @@
 #include "derivative_metric.hpp"
-#include "cholesky_update.hpp"
+#include "cholesky_pivot.hpp"
 #include "parallel_shell_tasks.hpp"
 #include <algorithm>
 #include <array>
@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -100,7 +101,8 @@ std::size_t value_index(const Kernel& kernel, std::array<std::size_t,4> dims,
 std::vector<double> derivative_cross_metric(
     const LibcintContext& ctx, const std::vector<double>& left, std::size_t nleft,
     Basis left_basis, const std::vector<double>& right, std::size_t nright,
-    Basis right_basis, double tolerance, std::size_t max_rank, bool debug)
+    Basis right_basis, double tolerance, std::size_t max_rank, bool debug,
+    CholeskyAlgorithm algorithm, std::uint64_t seed)
 {
     if (!std::isfinite(tolerance) || tolerance < 0)
         throw std::invalid_argument("Cholesky tolerance must be finite and nonnegative");
@@ -157,7 +159,9 @@ std::vector<double> derivative_cross_metric(
     if (debug) {
         const auto seconds=std::chrono::duration<double>(
             std::chrono::steady_clock::now()-diagonal_started).count();
-        std::cerr << "[cholesky derivative] channels=("
+        std::cerr << "[cholesky derivative] algorithm="
+                  << (algorithm == CholeskyAlgorithm::UnblockedUniform ?
+                      "unblocked_uniform" : "unblocked_greedy") << " channels=("
                   << left_basis[0] << left_basis[1] << ','
                   << right_basis[0] << right_basis[1] << ") shells=" << nshells
                   << " pairs=" << dimension
@@ -167,10 +171,12 @@ std::vector<double> derivative_cross_metric(
     }
     const auto first=std::max_element(diagonal.begin(),diagonal.end());
     CholeskyCandidate next{*first,static_cast<std::size_t>(first-diagonal.begin()),false};
+    std::mt19937_64 generator(seed);
     while (pivots.size()<cap) {
-        const double pivot_value=next.residual;
-        if (pivot_value<=cutoff || pivot_value<=0) break;
-        const auto pivot=next.index;
+        if (next.residual<=cutoff || next.residual<=0) break;
+        const auto selected=choose_cholesky_pivot(diagonal,next,cutoff,algorithm,generator);
+        const auto pivot_value=selected.residual;
+        const auto pivot=selected.index;
         const auto pivot_channel=pivot/npair;
         const auto mu=(pivot%npair)/nao, nu=(pivot%npair)%nao;
         const auto& a=shells[ao_shell[mu]];

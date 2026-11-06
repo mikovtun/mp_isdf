@@ -74,6 +74,47 @@ class TestCoulombMetric(unittest.TestCase):
             residual[pivot] = 0.0
         return np.array(factors), pivots, residual
 
+    def test_uniform_pivots_and_metric(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='6-31g', verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        mu, nu = np.tril_indices(mol.nao_nr())
+        packed = mol.intor('int2e', aosym='s1')[mu[:, None], nu[:, None],
+                                                mu[None, :], nu[None, :]]
+        kwargs = dict(algorithm='unblocked_uniform', seed=23)
+        factors, pivots, residual = mp_isdf.cholesky_eri(ctx, **kwargs)
+        repeated = mp_isdf.cholesky_eri(ctx, **kwargs)
+        for first, second in zip((factors, pivots, residual), repeated):
+            np.testing.assert_array_equal(first, second)
+        self.assertEqual(len(set(pivots)), len(pivots))
+        np.testing.assert_allclose(factors.T @ factors, packed, atol=2e-10, rtol=2e-10)
+        self.assertLessEqual(residual.max(), 1e-12*np.diag(packed).max() + 1e-12)
+        choices = {int(mp_isdf.cholesky_eri(ctx, max_rank=1, algorithm='unblocked_uniform',
+                                            seed=seed)[1][0]) for seed in range(16)}
+        self.assertGreater(len(choices), 1)
+        transform = np.random.default_rng(5).normal(size=(3, mol.nao_nr()**2))
+        full = transform.reshape(3, mol.nao_nr(), mol.nao_nr())
+        expected = np.einsum('aij,ijkl,bkl->ab', full,
+                             mol.intor('int2e', aosym='s1'), full)
+        np.testing.assert_allclose(mp_isdf.coulomb_metric(ctx, transform, **kwargs),
+                                   expected, atol=2e-10, rtol=2e-10)
+        with self.assertRaises(ValueError):
+            build_isdf(mol, metric_algorithm='unblocked_uniform', metric_seed=-1)
+
+    def test_uniform_derivative_channels(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='sto-3g', verbose=0)
+        ctx = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        nao = mol.nao_nr()
+        identity = np.eye(nao*nao)
+        actual = mp_isdf.derivative_cross_metric(
+            ctx, identity, (0, 0), identity, (3, 3),
+            algorithm='unblocked_uniform', seed=7)
+        expected = (mol.intor('int2e_ipvip1', comp=9, aosym='s1')[8]
+                    .transpose(2, 3, 0, 1).reshape(nao*nao, nao*nao))
+        np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=1e-10)
+        np.testing.assert_array_equal(actual, mp_isdf.derivative_cross_metric(
+            ctx, identity, (0, 0), identity, (3, 3),
+            algorithm='unblocked_uniform', seed=7))
+
     def test_parallel_correction_and_pivot_reduction(self):
         # 14 AOs give 105 packed pairs, above the host reduction threshold.
         mol = gto.M(atom='He 0 0 0', basis='cc-pvtz', verbose=0)

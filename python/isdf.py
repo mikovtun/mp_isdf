@@ -143,7 +143,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
-               derivative_targets=(), selection_only=False, debug=False):
+               derivative_targets=(), selection_only=False, debug=False,
+               metric_seed=0):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -153,7 +154,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
     `metric_algorithm="unblocked_greedy"` uses the host integral-direct
     Cholesky metric (`metric_tol` is relative to the largest initial ERI
-    diagonal); `"grid"` uses the spherical-cell grid approximation instead.
+    diagonal); `"unblocked_uniform"` samples pivots uniformly among pairs
+    with residual above the cutoff, reproducibly with `metric_seed`.
+    `"grid"` uses the spherical-cell grid approximation instead.
     `derivative_targets` lists four-slot strings such as '00xy' and 'x00y',
     or 'all' for all 54 two-derivative spatial ERIs. '0000' selects the
     ordinary AO ISDF path; with `--compare` it compares the full scalar ERI.
@@ -189,8 +192,10 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         axis_types = [AXES[axis] if isinstance(axis, str) else axis for axis in axes]
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
-    if metric_algorithm not in ("grid", "unblocked_greedy"):
+    if metric_algorithm not in ("grid", "unblocked_greedy", "unblocked_uniform"):
         raise ValueError(f"unknown metric algorithm: {metric_algorithm!r}")
+    if not isinstance(metric_seed, (int, np.integer)) or not 0 <= metric_seed < 2**64:
+        raise ValueError("metric_seed must be an unsigned 64-bit integer")
     if selection_only and compute_metric:
         raise ValueError("selection_only requires compute_metric=False")
     if isinstance(derivative_targets, str):
@@ -291,7 +296,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             raw = mp_isdf.coulomb_metric(
                 context, transform, algorithm=metric_algorithm,
                 tolerance=metric_tol, max_rank=metric_rank,
-                batch_size=metric_batch_size, debug=debug,
+                batch_size=metric_batch_size, debug=debug, seed=metric_seed,
             )
         return anchor_weights[:, None] * raw * anchor_weights[None, :]
 
@@ -351,6 +356,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                         context, left_coeff, tuple(labels[c] for c in left_label),
                         right_coeff, tuple(labels[c] for c in right_label),
                         tolerance=metric_tol, max_rank=metric_rank, debug=debug,
+                        algorithm=metric_algorithm, seed=metric_seed,
                     )
                 cross_metrics[pair] = anchor_weights[:, None] * raw * anchor_weights[None, :]
             target_factors[target] = {
@@ -420,13 +426,15 @@ def main():
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
                         help="where AO evaluation and QRCP run")
-    parser.add_argument("--metric", choices=("unblocked_greedy", "grid"),
+    parser.add_argument("--metric", choices=("unblocked_greedy", "unblocked_uniform", "grid"),
                         default="unblocked_greedy",
                         help="Coulomb metric algorithm (default: unblocked_greedy)")
     parser.add_argument("--metric-tol", type=float, default=1e-12,
                         help="relative Cholesky residual cutoff (ignored for --metric grid)")
     parser.add_argument("--metric-rank", type=int, default=0,
                         help="maximum ERI Cholesky rank (0: tolerance only; ignored for grid)")
+    parser.add_argument("--metric-seed", type=int, default=0,
+                        help="random seed for unblocked_uniform (default: 0)")
     parser.add_argument("--metric-batch-size", type=int, default=64,
                         help="AO projection rows per BLAS++ batch (default: 64)")
     parser.add_argument("--derivative-target", action="append", default=[],
@@ -452,6 +460,8 @@ def main():
         parser.error("--metric-rank must be nonnegative")
     if args.metric_batch_size <= 0:
         parser.error("--metric-batch-size must be positive")
+    if not 0 <= args.metric_seed < 2**64:
+        parser.error("--metric-seed must be an unsigned 64-bit integer")
     if args.compare and args.no_metric:
         parser.error("--compare requires a metric (omit --no-metric)")
     runner_started = time.perf_counter()
@@ -470,6 +480,7 @@ def main():
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         metric_batch_size=args.metric_batch_size,
+                        metric_seed=args.metric_seed,
                         derivative_targets=args.derivative_target,
                         report_timings=not args.debug, debug=args.debug)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "

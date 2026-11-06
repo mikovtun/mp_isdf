@@ -2,7 +2,7 @@
 
 A C++/Python prototype for **interpolative separable density fitting (ISDF)** of molecular AO products. PySCF supplies the molecule and integration grid; a pybind11 module evaluates atomic orbitals with libcint, selects interpolation anchors by pivoted QR, and builds Coulomb metrics. The Python driver fits the interpolation vectors and can compare reconstructed integrals or J/K matrices with PySCF.
 
-The default metric is an **integral-direct, unblocked greedy Cholesky** decomposition of AO-pair electron-repulsion integrals (ERIs). It does not construct the full AO-pair ERI matrix or call LAPACK Cholesky. Independent libcint shell quartets and sufficiently large pair updates run on Kokkos host threads; the ordinary metric projection uses batched BLAS++ GEMMs. An approximate grid-based metric is also available. This is a research prototype, not an installed Python package.
+The default metric is an **integral-direct, unblocked greedy Cholesky** decomposition of AO-pair electron-repulsion integrals (ERIs). An `unblocked_uniform` variant samples eligible pivots uniformly instead of always selecting the largest residual. Neither variant constructs the full AO-pair ERI matrix or calls LAPACK Cholesky. Independent libcint shell quartets and sufficiently large pair updates run on Kokkos host threads; the ordinary metric projection uses batched BLAS++ GEMMs. An approximate grid-based metric is also available. This is a research prototype, not an installed Python package.
 
 ## Build
 
@@ -40,7 +40,11 @@ OMP_PROC_BIND=false python python/isdf.py --anchor-rank 3 --compare
 OMP_PROC_BIND=false python python/isdf.py \
   --anchor-rank 3 --derivative-target 00xy --compare
 
-# Log greedy pivots, residuals, shell-quartet counts, and timings
+# Sample Cholesky pivots uniformly, with a reproducible seed
+OMP_PROC_BIND=false python python/isdf.py \
+  --anchor-rank 3 --metric unblocked_uniform --metric-seed 17
+
+# Log pivots, residuals, shell-quartet counts, and timings
 OMP_NUM_THREADS=4 OMP_PROC_BIND=false python python/isdf.py \
   --anchor-rank 3 --debug
 ```
@@ -52,8 +56,9 @@ The XYZ files in `python/xyz/` can be passed with `--molecule`; omitting it sele
 | `--axes ao,dx,dy,dz,occ` | Comma-separated features for **anchor selection**; `occ` requires a converged closed-shell RHF calculation. The default is `ao`. |
 | `--anchor-rank N`, `--anchor-tol T` | Maximum number of anchors (`0` means no rank cap) and relative QR cutoff. |
 | `--level N`, `--space auto\|host\|device` | PySCF grid level and AO/QR execution space. |
-| `--metric unblocked_greedy\|grid` | Integral-direct Cholesky (default), or the approximate spherical-cell grid metric. |
+| `--metric unblocked_greedy\|unblocked_uniform\|grid` | Largest-residual pivoting (default), uniformly sampled eligible pivots, or the approximate spherical-cell grid metric. |
 | `--metric-tol T`, `--metric-rank N` | Relative Cholesky diagonal-residual cutoff and optional rank cap (`0` means no cap). Ignored for `grid`. |
+| `--metric-seed N` | Unsigned 64-bit random seed for `unblocked_uniform` (default `0`); ignored by greedy and grid modes. |
 | `--metric-batch-size N` | AO projection rows per BLAS++ batch (default `64`); changes scratch use and host parallelism. |
 | `--derivative-target 00xy` | Request a four-AO-slot derivative target; repeat the option for multiple targets, use `0000` for ordinary ERIs, or use `all` for all 54 two-derivative spatial targets. |
 | `--no-metric` | Skip both scalar and derivative metrics but retain AO fitting and overlap validation. |
@@ -114,7 +119,7 @@ OMP_NUM_THREADS=4 OMP_PROC_BIND=false OPENBLAS_NUM_THREADS=1 \
   python -m unittest discover -s python/test -q
 ```
 
-Greedy pivots are sequential; work *within* each pivot is parallel. Debug output reports attempted shell-quartet calls, not the number of nonzero integrals, and these counts do not decrease with rank because shell screening has not been implemented. Factors and residuals remain host-resident. Factor storage grows with the Cholesky rank, and the metric projection builds only a batch of packed AO-pair coefficients at a time.
+Pivot iterations are sequential; work *within* each pivot is parallel. For `unblocked_uniform`, each pivot is drawn with equal probability from AO pairs whose current residual is strictly positive and above `metric_tol × initial_max_residual`. The stopping check still uses the **largest** remaining residual; a rank cap can give a worse approximation than greedy at the same rank. The seed makes repeated runs reproducible on the same C++ standard-library implementation. Debug output reports attempted shell-quartet calls, not the number of nonzero integrals, and these counts do not decrease with rank because shell screening has not been implemented. Factors and residuals remain host-resident. Factor storage grows with the Cholesky rank, and the metric projection builds only a batch of packed AO-pair coefficients at a time.
 
 BLAS++ delegates threading to its linked BLAS implementation. If CMake selects a sequential BLAS (as in a development build using sequential MKL), Kokkos distributes independent projection batches across host threads. A threaded BLAS may benefit from different thread and batch settings; avoid oversubscribing threads. `--debug` separates pivot integral/update timings from post-pivot projection and metric-GEMM timings.
 
@@ -122,7 +127,8 @@ BLAS++ delegates threading to its linked BLAS implementation. If CMake selects a
 
 - `python/isdf.py` — ISDF driver, CLI, grid metric, and PySCF comparisons.
 - `python/test/` — AO evaluation, anchor, metric, and derivative tests.
-- `cpp/src/coulomb_metric.cpp`, `cpp/src/derivative_metric.cpp` — integral-direct decompositions and metric contractions.
+- `cpp/src/cholesky_eri_greedy.cpp`, `cpp/src/cholesky_eri_uniform.cpp` — ordinary integral-direct Cholesky build and uniform-pivot entry point.
+- `cpp/src/coulomb_metric.cpp`, `cpp/src/derivative_metric.cpp` — ordinary metric projection and derivative integral-direct metric.
 - `cpp/include/cholesky_update.hpp` — host pair correction and deterministic next-pivot reduction.
 - `cpp/src/anchor_select_qrcp.cpp` — host LAPACK++ / optional device MAGMA QRCP.
 - `CMakeLists.txt` — C++ extension and dependency configuration.

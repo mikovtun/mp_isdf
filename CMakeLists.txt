@@ -177,7 +177,11 @@ if(ISDF_ENABLE_CUDA)
     target_compile_definitions(isdf_anchor_core PRIVATE ISDF_ENABLE_CUDA=1)
 endif()
 
-add_library(isdf_coulomb_core STATIC cpp/src/coulomb_metric.cpp cpp/src/derivative_metric.cpp)
+add_library(isdf_coulomb_core STATIC
+    cpp/src/cholesky_eri_greedy.cpp
+    cpp/src/cholesky_eri_uniform.cpp
+    cpp/src/coulomb_metric.cpp
+    cpp/src/derivative_metric.cpp)
 target_include_directories(isdf_coulomb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
 target_link_libraries(isdf_coulomb_core PUBLIC mp_isdf_orbitals blaspp)
 set_target_properties(isdf_coulomb_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

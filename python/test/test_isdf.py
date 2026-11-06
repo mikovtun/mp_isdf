@@ -230,9 +230,10 @@ class TestMinimalISDF(unittest.TestCase):
                                        atol=1e-10, rtol=1e-10,
                                        err_msg=f"target {target}")
         for axes, metric in (("ao", "unblocked_greedy"),
+                             ("ao", "unblocked_uniform"),
                              (("ao", "dz"), "grid")):
             result = build_isdf(mol, level=0, anchor_rank=3, axes=axes,
-                                metric_algorithm=metric,
+                                metric_algorithm=metric, metric_seed=7,
                                 derivative_targets=("00zz", "z00z"))
             self.assertIsNotNone(result["coulomb_metric"])
             self.assertEqual(set(result["derivative_integrals"]), {"00zz", "z00z"})
