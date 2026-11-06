@@ -13,7 +13,8 @@ from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isdf import (_reference_target, build_isdf, evaluate_isdf_jk,
-                  grid_coulomb_metric, grid_cross_metric, main, mp_isdf)
+                  grid_coulomb_metric, grid_cross_metric, main, mp_isdf,
+                  pair_space_error_norms)
 
 
 class TestMinimalISDF(unittest.TestCase):
@@ -57,6 +58,7 @@ class TestMinimalISDF(unittest.TestCase):
             np.linalg.norm(approx - overlap) / np.linalg.norm(overlap),
         )
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
+        self.assertIsNone(result["pair_space_errors"])
         self.assertEqual(list(result["timings"]), [
             "grid", "context", "anchor_selection", "ao_evaluation",
             "isdf_fit", "overlap_check", "coulomb_metric",
@@ -64,6 +66,59 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertTrue(all(value >= 0 for value in result["timings"].values()))
         np.testing.assert_allclose(sum(result["timings"].values()), result["elapsed"],
                                    rtol=1e-12, atol=1e-12)
+
+    def test_pair_space_error_independent_of_metric(self):
+        result = build_isdf(self.mol, level=0, anchor_rank=2,
+                            compute_metric=False, pair_space_error=True,
+                            derivative_targets=("x00y", "x0y0"))
+        self.assertIsNone(result["coulomb_metric"])
+        self.assertEqual(result["derivative_integrals"], {})
+        self.assertEqual(set(result["pair_space_errors"]), {"scalar", "x0", "0y", "y0"})
+        self.assertIn("pair_space_check", result["timings"])
+        self.assertIn("derivative_pair_space_check", result["timings"])
+        context = mp_isdf.LibcintContext(self.mol._atm, self.mol._bas, self.mol._env)
+        ao = context.eval_ao(result["coordinates"])
+        gradient = context.eval_ao_gradient(result["coordinates"])
+        anchor_ao = context.eval_ao(result["anchor_coords"])
+        anchor_gradient = context.eval_ao_gradient(result["anchor_coords"])
+        fields = {"0": ao, **dict(zip("xyz", gradient))}
+        anchor_fields = {"0": anchor_ao, **dict(zip("xyz", anchor_gradient))}
+        for label, error in result["pair_space_errors"].items():
+            left, right = ("0", "0") if label == "scalar" else label
+            exact = (fields[left][:, :, None] * fields[right][:, None, :]).reshape(len(ao), -1)
+            anchors = (anchor_fields[left][:, :, None] *
+                       anchor_fields[right][:, None, :]).reshape(len(anchor_ao), -1)
+            if label == "scalar":
+                theta = result["interp_vecs"]
+            else:
+                theta = (exact @ np.linalg.pinv(
+                    anchors * result["anchor_weights"][:, None], rcond=1e-12)).T
+            reconstructed = theta.T @ (anchors * result["anchor_weights"][:, None])
+            weights = np.abs(result["weights"])[:, None]
+            expected_l2 = np.sqrt(np.sum(weights * (exact - reconstructed)**2))
+            expected_rel = expected_l2 / np.sqrt(np.sum(weights * exact**2))
+            np.testing.assert_allclose(error["l2"], expected_l2, rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(error["relative"], expected_rel, rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(result["pair_space_errors"]["scalar"]["l2"],
+                                   pair_space_error_norms(
+                             (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1),
+                             (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(len(anchor_ao), -1),
+                             result["anchor_weights"], result["interp_vecs"],
+                             result["weights"], block_size=1)["l2"])
+
+    def test_pair_space_error_requires_fit(self):
+        with self.assertRaisesRegex(ValueError, "pair_space_error requires fitting"):
+            build_isdf(self.mol, compute_metric=False, selection_only=True,
+                       pair_space_error=True)
+
+    def test_pair_space_error_with_signed_grid_weights(self):
+        exact = np.array([[1., 2.], [3., 4.]])
+        anchor = np.array([[1., 0.]])
+        theta = np.array([[1., 3.]])
+        error = pair_space_error_norms(exact, anchor, np.array([1.]), theta,
+                                       np.array([2., -1.]), block_size=1)
+        np.testing.assert_allclose(error["l2"], np.sqrt(24.))
+        np.testing.assert_allclose(error["relative"], np.sqrt(24. / 35.))
 
     def test_timings_are_reported_during_build(self):
         output = io.StringIO()

@@ -139,12 +139,34 @@ def evaluate_isdf_jk(result, dm):
     return 0.5 * (j + j.T), 0.5 * (k + k.T)
 
 
+def pair_space_error_norms(pair_grid, pair_anchor, anchor_weights, theta, grid_weights,
+                           block_size=256):
+    """Absolute and relative grid-weighted L2 error of a fitted pair channel.
+
+    Pair columns retain their ordered AO indices. Absolute grid weights define
+    a positive norm even when the quadrature contains negative weights.
+    """
+    weighted_anchor = pair_anchor * anchor_weights[:, None]
+    residual_sq = exact_sq = 0.0
+    for first in range(0, len(grid_weights), block_size):
+        last = min(first + block_size, len(grid_weights))
+        exact = pair_grid[first:last]
+        reconstructed = theta[:, first:last].T @ weighted_anchor
+        weight = np.abs(grid_weights[first:last])
+        residual_sq += np.einsum("g,gi,gi->", weight, exact - reconstructed,
+                                 exact - reconstructed, optimize=True)
+        exact_sq += np.einsum("g,gi,gi->", weight, exact, exact, optimize=True)
+    absolute = np.sqrt(residual_sq)
+    relative = absolute / np.sqrt(exact_sq) if exact_sq else (0.0 if absolute == 0 else np.inf)
+    return {"l2": absolute, "relative": relative}
+
+
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
-               metric_seed=0):
+               metric_seed=0, pair_space_error=False):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -169,8 +191,11 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     X1..X4 and `coulomb_metric` always describe ordinary AO ISDF.
     `compute_metric=False` skips both scalar and derivative metrics.
     `selection_only=True` returns immediately after anchor selection (and
-    requires compute_metric=False). `debug` logs greedy Cholesky pivots and
-    suppresses live timing output; timings remain available in the result.
+    requires compute_metric=False). `pair_space_error=True` checks the grid-
+    weighted L2 reconstruction of ordinary AO pairs and each distinct requested
+    derivative pair channel, independently of `compute_metric`. `debug` logs
+    greedy Cholesky pivots and suppresses live timing output; timings remain
+    available in the result.
     Otherwise `report_timings` prints completed stages immediately.
     """
     started = time.perf_counter()
@@ -198,6 +223,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         raise ValueError("metric_seed must be an unsigned 64-bit integer")
     if selection_only and compute_metric:
         raise ValueError("selection_only requires compute_metric=False")
+    if selection_only and pair_space_error:
+        raise ValueError("pair_space_error requires fitting; disable selection_only")
     if isinstance(derivative_targets, str):
         derivative_targets = (derivative_targets,)
     derivative_targets = tuple(dict.fromkeys(derivative_targets))
@@ -253,6 +280,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             "interp_vecs": None,
             "overlap_reconstruction": None,
             "overlap_relative_error": None,
+            "pair_space_errors": None,
             "coulomb_metric": None,
             "derivative_integrals": {},
             "target_factors": {},
@@ -279,6 +307,13 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     # where an integral is evaluated, not stored in the vectors themselves.
     interp_vecs = (products @ transform.T).T
     record("isdf_fit")
+    pair_space_errors = None
+    if pair_space_error:
+        pair_space_errors = {
+            "scalar": pair_space_error_norms(products, anchor_pairs, anchor_weights,
+                                             interp_vecs, weights)
+        }
+        record("pair_space_check")
 
     overlap = mol.intor("int1e_ovlp")
     overlap_approx = np.einsum(
@@ -317,7 +352,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
             "X3": anchor_ao, "X4": anchor_ao,
             "coulomb_metric": metric,
         }
-    if compute_metric and derivative_targets:
+    if derivative_targets and (compute_metric or pair_space_error):
         gradient = context.eval_ao_gradient(coords, space=space)
         anchor_gradient = context.eval_ao_gradient(anchor_coords, space=space)
         fields = {"0": ao, **dict(zip("xyz", gradient))}
@@ -339,39 +374,52 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                 channels[label] = pair_anchor, coefficients, theta
             return channels[label]
 
-        for target in derivative_targets:
-            target_started = time.perf_counter()
-            left_label, right_label = _target_labels(target)
-            left_pairs, left_coeff, left_theta = channel(left_label)
-            right_pairs, right_coeff, right_theta = channel(right_label)
-            pair = left_label, right_label
-            if pair not in cross_metrics:
-                if metric_algorithm == "grid":
-                    raw = grid_cross_metric(left_theta, right_theta, coords, weights)
-                else:
-                    labels = {"0": 0, "x": 1, "y": 2, "z": 3}
-                    if debug:
-                        print(f"[cholesky target {target}]", file=sys.stderr, flush=True)
-                    raw = mp_isdf.derivative_cross_metric(
-                        context, left_coeff, tuple(labels[c] for c in left_label),
-                        right_coeff, tuple(labels[c] for c in right_label),
-                        tolerance=metric_tol, max_rank=metric_rank, debug=debug,
-                        algorithm=metric_algorithm, seed=metric_seed,
-                    )
-                cross_metrics[pair] = anchor_weights[:, None] * raw * anchor_weights[None, :]
-            target_factors[target] = {
-                "X1": anchor_fields[left_label[0]],
-                "X2": anchor_fields[left_label[1]],
-                "X3": anchor_fields[right_label[0]],
-                "X4": anchor_fields[right_label[1]],
-                "coulomb_metric": cross_metrics[pair],
-            }
-            derivative_integrals[target] = (left_pairs.T @ cross_metrics[pair] @ right_pairs
-                                            ).reshape(nao, nao, nao, nao)
-            if report_timings and not debug:
-                print(f"    target {target:<4s} {time.perf_counter()-target_started:10.6f} s",
-                      flush=True)
-        record("derivative_integrals")
+        if pair_space_error:
+            labels = dict.fromkeys(label for target in derivative_targets
+                                   for label in _target_labels(target))
+            for label in labels:
+                pair_anchor, _, theta = channel(label)
+                left, right = label
+                pair_grid = (fields[left][:, :, None] *
+                             fields[right][:, None, :]).reshape(len(coords), nao*nao)
+                pair_space_errors[label] = pair_space_error_norms(
+                    pair_grid, pair_anchor, anchor_weights, theta, weights)
+            record("derivative_pair_space_check")
+
+        if compute_metric:
+            for target in derivative_targets:
+                target_started = time.perf_counter()
+                left_label, right_label = _target_labels(target)
+                left_pairs, left_coeff, left_theta = channel(left_label)
+                right_pairs, right_coeff, right_theta = channel(right_label)
+                pair = left_label, right_label
+                if pair not in cross_metrics:
+                    if metric_algorithm == "grid":
+                        raw = grid_cross_metric(left_theta, right_theta, coords, weights)
+                    else:
+                        labels = {"0": 0, "x": 1, "y": 2, "z": 3}
+                        if debug:
+                            print(f"[cholesky target {target}]", file=sys.stderr, flush=True)
+                        raw = mp_isdf.derivative_cross_metric(
+                            context, left_coeff, tuple(labels[c] for c in left_label),
+                            right_coeff, tuple(labels[c] for c in right_label),
+                            tolerance=metric_tol, max_rank=metric_rank, debug=debug,
+                            algorithm=metric_algorithm, seed=metric_seed,
+                        )
+                    cross_metrics[pair] = anchor_weights[:, None] * raw * anchor_weights[None, :]
+                target_factors[target] = {
+                    "X1": anchor_fields[left_label[0]],
+                    "X2": anchor_fields[left_label[1]],
+                    "X3": anchor_fields[right_label[0]],
+                    "X4": anchor_fields[right_label[1]],
+                    "coulomb_metric": cross_metrics[pair],
+                }
+                derivative_integrals[target] = (left_pairs.T @ cross_metrics[pair] @ right_pairs
+                                                ).reshape(nao, nao, nao, nao)
+                if report_timings and not debug:
+                    print(f"    target {target:<4s} {time.perf_counter()-target_started:10.6f} s",
+                          flush=True)
+            record("derivative_integrals")
     return {
         "anchor_indices": anchor_indices,
         "anchor_coords": anchor_coords,
@@ -381,6 +429,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         "interp_vecs": interp_vecs,
         "overlap_reconstruction": overlap_approx,
         "overlap_relative_error": overlap_relative_error,
+        "pair_space_errors": pair_space_errors,
         "coulomb_metric": metric,
         "derivative_integrals": derivative_integrals,
         "target_factors": target_factors,
@@ -440,6 +489,8 @@ def main():
     parser.add_argument("--derivative-target", action="append", default=[],
                         help="ERI slots (0000 for ordinary AOs; e.g. 00xy or x00y for derivatives); "
                              "repeat, or use 'all' for two derivatives")
+    parser.add_argument("--pair-space-error", action="store_true",
+                        help="check grid-weighted L2 pair-product reconstruction, including requested derivative channels")
     parser.add_argument("--no-metric", action="store_true",
                         help="skip scalar and derivative metrics; keep the AO fit and overlap check")
     parser.add_argument("--compare", action="store_true",
@@ -482,6 +533,7 @@ def main():
                         metric_batch_size=args.metric_batch_size,
                         metric_seed=args.metric_seed,
                         derivative_targets=args.derivative_target,
+                        pair_space_error=args.pair_space_error,
                         report_timings=not args.debug, debug=args.debug)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
@@ -490,6 +542,10 @@ def main():
               "for tolerance-only selection or a larger value for a higher cap.")
     if result["overlap_relative_error"] is not None:
         print(f"Overlap reconstruction relative error: {result['overlap_relative_error']:.3e}")
+    if result["pair_space_errors"] is not None:
+        for label, error in result["pair_space_errors"].items():
+            print(f"Pair-space {label} grid L2 error: {error['l2']:.3e}; "
+                  f"relative error: {error['relative']:.3e}")
     if result["coulomb_metric"] is not None:
         print("Coulomb metric shape:", result["coulomb_metric"].shape)
     if not args.debug:
