@@ -168,7 +168,8 @@ set_target_properties(mp_isdf_orbitals PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(isdf_anchor_core STATIC
     cpp/src/anchor_select.cpp
-    cpp/src/anchor_select_qrcp.cpp)
+    cpp/src/anchor_select_qrcp.cpp
+    cpp/src/anchor_select_online_qr.cpp)
 target_include_directories(isdf_anchor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
 target_link_libraries(isdf_anchor_core PUBLIC mp_isdf_orbitals lapackpp)
 set_target_properties(isdf_anchor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

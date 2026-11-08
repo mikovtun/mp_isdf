@@ -55,6 +55,8 @@ The XYZ files in `python/xyz/` can be passed with `--molecule`; omitting it sele
 | --- | --- |
 | `--axes ao,dx,dy,dz,occ` | Comma-separated features for **anchor selection**; `occ` requires a converged closed-shell RHF calculation. The default is `ao`. |
 | `--anchor-rank N`, `--anchor-tol T` | Maximum number of anchors (`0` means no rank cap) and relative QR cutoff. |
+| `--anchor-algorithm dense\|online` | Dense LAPACK/MAGMA QRCP (default), or bounded-batch Kokkos online QRCP. |
+| `--anchor-batch-size N` | Grid points per batch for `--anchor-algorithm online` (default `128`). |
 | `--level N`, `--space auto\|host\|device` | PySCF grid level and AO/QR execution space. |
 | `--metric unblocked_greedy\|unblocked_uniform\|grid` | Largest-residual pivoting (default), uniformly sampled eligible pivots, or the approximate spherical-cell grid metric. |
 | `--metric-tol T`, `--metric-rank N` | Relative Cholesky diagonal-residual cutoff and optional rank cap (`0` means no cap). Ignored for `grid`. |
@@ -67,6 +69,8 @@ The XYZ files in `python/xyz/` can be passed with `--molecule`; omitting it sele
 | `--debug` | Emit Cholesky rank/ERI-quartet/residual diagnostics to stderr. Print the timing report at the **end** of stdout, after comparisons. |
 
 The derivative-target string has four slots `(u,v,w,x)` drawn from `0xyz`. Exactly two nonzero letters denote first electronic-coordinate derivatives acting on those **individual AOs**; these are not nuclear gradients or assembled spinor integrals. `axes` does not change which AO slots are differentiated. Derivative pair channels are fitted independently using the selected anchors.
+
+For bounded-batch anchor selection, pass `--anchor-algorithm online` to the Python driver (and optionally `--anchor-batch-size N`), or use `anchor_algorithm="online"` and `anchor_batch_size=N` in `build_isdf`. At the extension API, pass `algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting` and optionally `batch_size=128` to `AnchorSelection.select(...)`. Dense LAPACK/MAGMA QRCP remains the default. Online QRCP uses Kokkos AO evaluation and pair-product generation in the requested `space="host"` or `space="device"` (CUDA build), streaming grid batches instead of building the full pair-product matrix. It keeps one Householder reflector per selected anchor, incrementally updates column norms, selectively refreshes unreliable estimates, verifies each candidate directly, and performs a full direct scan before stopping. Like dense selection, its cutoff is relative to the largest initial column norm; it also stops at a floating-point numerical-rank floor. Zero-weight grid points are skipped, and signed weights are treated as `sqrt(abs(weight))`. With `M=axis_width²`, `N=nonzero_grid_points`, batch size `b`, and selected rank `k`, peak selection working storage is approximately `O(M*k + M*b + N + axis_width*b)` (plus the input grid and AO context; occupied-orbital axes also stage the `nao²` MO coefficients per batch); rank-unlimited selection can still consume substantial reflector memory. This is multipass and can be considerably slower than dense QRCP, particularly on GPU where reflector application currently processes one column per work item. With `--debug`, it reports the selected rank, dimensions and batch size, initial and final maximum residuals, full-scan count, candidate verification/reselection counts, norm-update and refresh counts, and elapsed selection time. It does not change the driver’s subsequent NumPy fitting allocations.
 
 The grid metric evaluates pairwise grid distances and is primarily a small-system/reference alternative; its cost grows quadratically with the number of grid points. Explicit `--compare` reconstructs a four-index tensor, so it should also be used on small systems.
 
@@ -83,6 +87,7 @@ from isdf import build_isdf, evaluate_isdf_jk
 
 mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
 result = build_isdf(mol, level=0, anchor_rank=3,
+                    anchor_algorithm="online", anchor_batch_size=128,
                     derivative_targets=("00xy",))
 
 print(result["anchor_indices"], result["overlap_relative_error"])
@@ -133,7 +138,8 @@ BLAS++ delegates threading to its linked BLAS implementation. If CMake selects a
 - `cpp/src/cholesky_eri_greedy.cpp`, `cpp/src/cholesky_eri_uniform.cpp` — ordinary integral-direct Cholesky build and uniform-pivot entry point.
 - `cpp/src/coulomb_metric.cpp`, `cpp/src/derivative_metric.cpp` — ordinary metric projection and derivative integral-direct metric.
 - `cpp/include/cholesky_update.hpp` — host pair correction and deterministic next-pivot reduction.
-- `cpp/src/anchor_select_qrcp.cpp` — host LAPACK++ / optional device MAGMA QRCP.
+- `cpp/src/anchor_select_qrcp.cpp` — host LAPACK++ / optional device MAGMA dense QRCP.
+- `cpp/src/anchor_select_online_qr.cpp` — bounded-batch, multipass Kokkos Householder QRCP.
 - `CMakeLists.txt` — C++ extension and dependency configuration.
 
 `mp_isdf` (the C++ executable) is currently a placeholder; **`python/isdf.py` is the usable runner**.

@@ -163,6 +163,7 @@ def pair_space_error_norms(pair_grid, pair_anchor, anchor_weights, theta, grid_w
 
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
+               anchor_algorithm="dense", anchor_batch_size=128,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
@@ -174,7 +175,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     `anchor_rank=0` leaves rank to the QR diagonal `anchor_tol`. Anchor indices
     are relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
-    `metric_algorithm="unblocked_greedy"` uses the host integral-direct
+    `anchor_algorithm` is `dense` (LAPACK++/MAGMA, default) or `online`
+    (bounded-batch Kokkos Householder QRCP); `anchor_batch_size` controls the
+    online selector's grid batch. `metric_algorithm="unblocked_greedy"` uses the host integral-direct
     Cholesky metric (`metric_tol` is relative to the largest initial ERI
     diagonal); `"unblocked_uniform"` samples pivots uniformly among pairs
     with residual above the cutoff, reproducibly with `metric_seed`.
@@ -217,6 +220,10 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         axis_types = [AXES[axis] if isinstance(axis, str) else axis for axis in axes]
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
+    if anchor_algorithm not in ("dense", "online"):
+        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense' or 'online'")
+    if not isinstance(anchor_batch_size, (int, np.integer)) or anchor_batch_size <= 0:
+        raise ValueError("anchor_batch_size must be a positive integer")
     if metric_algorithm not in ("grid", "unblocked_greedy", "unblocked_uniform"):
         raise ValueError(f"unknown metric algorithm: {metric_algorithm!r}")
     if not isinstance(metric_seed, (int, np.integer)) or not 0 <= metric_seed < 2**64:
@@ -263,9 +270,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         raise ValueError("RHF mean-field object has not converged")
     coefficients = np.ascontiguousarray(mf.mo_coeff) if needs_occ else None
     nocc = mol.nelectron // 2 if needs_occ else 0
+    anchor_choice = (mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting
+                     if anchor_algorithm == "online"
+                     else mp_isdf.LocalAnchorSelectionAlgorithm.QRColumnPivoting)
     anchor_indices = np.asarray(selector.select(
         all_coords, all_weights, axis_types, tolerance=anchor_tol,
-        max_rank=anchor_rank, mo_coeff=coefficients, nocc=nocc, space=space,
+        max_rank=anchor_rank, algorithm=anchor_choice,
+        mo_coeff=coefficients, nocc=nocc, space=space,
+        batch_size=anchor_batch_size, debug=debug,
     ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("QRCP found no significant anchors; adjust tolerance or grid")
@@ -471,6 +483,10 @@ def main():
                         help="maximum anchor rank (0: tolerance only; default: 0)")
     parser.add_argument("--anchor-tol", type=float, default=1e-10,
                         help="relative QR diagonal cutoff")
+    parser.add_argument("--anchor-algorithm", choices=("dense", "online"), default="dense",
+                        help="anchor QRCP: dense LAPACK/MAGMA (default) or bounded-batch online Kokkos")
+    parser.add_argument("--anchor-batch-size", type=int, default=128,
+                        help="grid points per AO batch for --anchor-algorithm online")
     parser.add_argument("--axes", default="ao",
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
@@ -501,6 +517,8 @@ def main():
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
+    if args.anchor_batch_size <= 0:
+        parser.error("--anchor-batch-size must be positive")
     if not np.isfinite(args.anchor_tol) or args.anchor_tol < 0:
         parser.error("--anchor-tol must be finite and nonnegative")
     if args.level < 0:
@@ -528,6 +546,8 @@ def main():
     result = build_isdf(mol, mf, level=args.level, anchor_rank=args.anchor_rank,
                         anchor_tol=args.anchor_tol, axes=axes,
                         compute_metric=not args.no_metric, space=args.space,
+                        anchor_algorithm=args.anchor_algorithm,
+                        anchor_batch_size=args.anchor_batch_size,
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         metric_batch_size=args.metric_batch_size,

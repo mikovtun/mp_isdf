@@ -22,6 +22,7 @@ enum class DistributedAnchorSelectionAlgorithm {
 // Defines algorithm that drives AnchorSelection class, local. These are non-tiled and are single-node
 enum class LocalAnchorSelectionAlgorithm {
   QRColumnPivoting,
+  OnlineQRColumnPivoting,
   RandomizedQRColumnPivoting  // NYI
 };
 

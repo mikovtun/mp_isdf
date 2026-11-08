@@ -13,6 +13,7 @@
 namespace isdf {
 
 class QRCPAnchorSelection;
+class OnlineQRAnchorSelection;
 
 #ifdef KOKKOS_ENABLE_CUDA
 using AnchorDeviceSpace = Kokkos::Cuda;
@@ -69,10 +70,12 @@ public:
         LocalAnchorSelectionAlgorithm algorithm = LocalAnchorSelectionAlgorithm::QRColumnPivoting,
         const std::vector<double>& mo_coeff = {},
         std::size_t nocc = 0,
-        EvaluationSpace space = EvaluationSpace::Auto) const;
+        EvaluationSpace space = EvaluationSpace::Auto,
+        std::size_t batch_size = 128, bool debug = false) const;
 
 private:
     friend class QRCPAnchorSelection;
+    friend class OnlineQRAnchorSelection;
     struct AxisSpec {
         std::size_t width;
         bool need_ao, need_grad;
