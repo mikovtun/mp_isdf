@@ -51,21 +51,22 @@ public:
 
     // Apply existing reflectors in their construction order: H[k-1]...H[0] A.
     void transform(Kokkos::View<double*, Space> a, std::size_t count,
-                   const std::vector<Kokkos::View<double*, Space>>& v,
-                   const std::vector<double>& tau) const
+                   const Kokkos::View<double*, Space>& v,
+                   const Kokkos::View<double*, Space>& tau,
+                   std::size_t rank) const
     {
         const std::size_t m = rows_;
-        for (std::size_t j = 0; j < v.size(); ++j) {
-            auto reflector = v[j];
-            const double t = tau[j];
-            Kokkos::parallel_for("online_apply_reflector", Kokkos::RangePolicy<Space>(0, count),
-                KOKKOS_LAMBDA(const std::size_t g) {
+        // Each grid column is independent. Apply its reflectors sequentially
+        // inside one work item, avoiding one kernel launch per reflector.
+        Kokkos::parallel_for("online_apply_reflectors", Kokkos::RangePolicy<Space>(0, count),
+            KOKKOS_LAMBDA(const std::size_t g) {
+                for (std::size_t j = 0; j < rank; ++j) {
                     double dot = 0;
-                    for (std::size_t i = j; i < m; ++i) dot += reflector(i)*a(g*m+i);
-                    dot *= t;
-                    for (std::size_t i = j; i < m; ++i) a(g*m+i) -= reflector(i)*dot;
-                });
-        }
+                    for (std::size_t i = j; i < m; ++i) dot += v(j*m+i)*a(g*m+i);
+                    dot *= tau(j);
+                    for (std::size_t i = j; i < m; ++i) a(g*m+i) -= v(j*m+i)*dot;
+                }
+            });
     }
 
     std::vector<double> norms(Kokkos::View<double*, Space> a, std::size_t count,
@@ -184,11 +185,12 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
     const std::size_t cap = std::min({m, n, max_rank ? max_rank : std::min(m,n)});
     std::vector<double> estimated(n), reference(n), initial(n);
     std::vector<unsigned char> selected(n, 0);
-    std::vector<Kokkos::View<double*, Space>> reflectors;
-    std::vector<double> taus;
+    std::size_t reflector_capacity = std::min<std::size_t>(cap, 8);
+    Kokkos::View<double*, Space> reflectors("online_reflectors", reflector_capacity*m);
+    Kokkos::View<double*, Space> taus("online_tau", reflector_capacity);
+    std::vector<double> tau_host;
     std::vector<std::size_t> result;
-    reflectors.reserve(cap);
-    taus.reserve(cap);
+    tau_host.reserve(cap);
     result.reserve(cap);
     std::size_t full_scans = 0, candidate_checks = 0, reselections = 0;
     std::size_t norm_updates = 0, refresh_columns = 0;
@@ -198,8 +200,8 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
             const std::size_t count = std::min(batch_size,n-start);
             std::vector<std::size_t> ids(original.begin()+start, original.begin()+start+count);
             auto a = stream.columns(ids);
-            if (direct) stream.transform(a, count, reflectors, taus);
-            auto norms = stream.norms(a, count, reflectors.size());
+            if (direct) stream.transform(a, count, reflectors, taus, result.size());
+            auto norms = stream.norms(a, count, result.size());
             for (std::size_t g = 0; g < count; ++g) {
                 estimated[start+g] = selected[start+g] ? 0 : norms[g];
                 reference[start+g] = estimated[start+g];
@@ -235,8 +237,8 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
         for (;;) {
             p = winner();
             auto a = stream.columns({original[p]});
-            stream.transform(a, 1, reflectors, taus);
-            const double norm = stream.norms(a, 1, reflectors.size())[0];
+            stream.transform(a, 1, reflectors, taus, result.size());
+            const double norm = stream.norms(a, 1, result.size())[0];
             ++candidate_checks;
             estimated[p] = reference[p] = norm;
             if (p == winner()) {
@@ -252,16 +254,33 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
             if (estimated[winner()] <= floor || estimated[winner()] <= tolerance*first) break;
             continue;
         }
-        const std::size_t k = reflectors.size();
+        const std::size_t k = result.size();
         double tau = 0;
         make_reflector(column, k, tau);
         for (std::size_t i = 0; i < k; ++i) column[i] = 0;
-        Kokkos::View<double*, Space> v("online_reflector", m);
-        auto h_v = Kokkos::create_mirror_view(v);
-        for (std::size_t i = 0; i < m; ++i) h_v(i) = column[i];
-        Kokkos::deep_copy(v, h_v);
-        reflectors.push_back(v);
-        taus.push_back(tau);
+        if (k == reflector_capacity) {
+            const std::size_t next_capacity = std::min(cap, std::max<std::size_t>(1, 2*reflector_capacity));
+            Kokkos::View<double*, Space> new_reflectors("online_reflectors_grown", next_capacity*m);
+            Kokkos::View<double*, Space> new_taus("online_tau_grown", next_capacity);
+            Kokkos::parallel_for("online_copy_reflectors", Kokkos::RangePolicy<Space>(0, k*m),
+                KOKKOS_LAMBDA(const std::size_t i) { new_reflectors(i) = reflectors(i); });
+            Kokkos::parallel_for("online_copy_tau", Kokkos::RangePolicy<Space>(0, k),
+                KOKKOS_LAMBDA(const std::size_t i) { new_taus(i) = taus(i); });
+            Kokkos::fence();
+            reflectors = new_reflectors;
+            taus = new_taus;
+            reflector_capacity = next_capacity;
+        }
+        Kokkos::View<double*, Space> staging("reflector_staging_device", m);
+        auto host_v = Kokkos::create_mirror_view(staging);
+        for (std::size_t i = 0; i < m; ++i) host_v(i) = column[i];
+        Kokkos::deep_copy(staging, host_v);
+        Kokkos::parallel_for("online_append_reflector", Kokkos::RangePolicy<Space>(0, m),
+            KOKKOS_LAMBDA(const std::size_t i) { reflectors(k*m+i) = staging(i); });
+        Kokkos::parallel_for("online_append_tau", Kokkos::RangePolicy<Space>(k, k+1),
+            KOKKOS_LAMBDA(const std::size_t i) { taus(i) = tau; });
+        Kokkos::fence();
+        tau_host.push_back(tau);
         result.push_back(original[p]);
         selected[p] = 1;
         estimated[p] = reference[p] = 0;
@@ -273,13 +292,14 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
             KOKKOS_LAMBDA(const std::size_t i) { q(i) = 1; });
         for (std::size_t rev = k+1; rev > 0; --rev) {
             const std::size_t j = rev-1;
-            auto r = reflectors[j];
+            auto r = reflectors;
+            const double tau_j = tau_host[j];
             double dot = 0;
             Kokkos::parallel_reduce("online_q_dot", Kokkos::RangePolicy<Space>(j,m),
-                KOKKOS_LAMBDA(const std::size_t i, double& sum) { sum += r(i)*q(i); }, dot);
-            const double factor = taus[j]*dot;
+                KOKKOS_LAMBDA(const std::size_t i, double& sum) { sum += r(j*m+i)*q(i); }, dot);
+            const double factor = tau_j*dot;
             Kokkos::parallel_for("online_q_update", Kokkos::RangePolicy<Space>(j,m),
-                KOKKOS_LAMBDA(const std::size_t i) { q(i) -= factor*r(i); });
+                KOKKOS_LAMBDA(const std::size_t i) { q(i) -= factor*r(j*m+i); });
         }
         for (std::size_t start = 0; start < n; start += std::min(batch_size,n-start)) {
             const std::size_t count = std::min(batch_size,n-start);
@@ -321,7 +341,7 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
             if (!refresh.empty()) {
                 refresh_columns += refresh.size();
                 auto b = stream.columns(refresh);
-                stream.transform(b, refresh.size(), reflectors, taus);
+                stream.transform(b, refresh.size(), reflectors, taus, k+1);
                 auto norms = stream.norms(b, refresh.size(), k+1);
                 for (std::size_t j = 0; j < refresh.size(); ++j) {
                     // original is ordered and each batch is a subset of [start,start+count).
