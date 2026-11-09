@@ -132,10 +132,13 @@ class TestAnchorSelection(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.selector.select(self.points, self.weights, axis,
                                  mo_coeff=np.ones((2, 1)), nocc=1)
-        with self.assertRaises(RuntimeError):
-            self.selector.select(self.points, self.weights,
-                                 mp_isdf.AxisType.AtomicOrbital,
-                                 algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting)
+        randomized = self.selector.select(
+            self.points, self.weights, mp_isdf.AxisType.AtomicOrbital,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting,
+            sketch_size=12, oversampling=3, max_rank=2, seed=7)
+        self.assertEqual(len(randomized), 2)
+        self.assertEqual(len(set(randomized)), 2)
+        self.assertNotIn(2, randomized)
         distributed = mp_isdf.DistributedAnchorSelection(self.context)
         with self.assertRaises(RuntimeError):
             distributed.select(self.points, self.weights, mp_isdf.AxisType.AtomicOrbital)

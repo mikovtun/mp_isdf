@@ -164,6 +164,8 @@ def pair_space_error_norms(pair_grid, pair_anchor, anchor_weights, theta, grid_w
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                axes=("ao",), compute_metric=True, space="auto",
                anchor_algorithm="dense", anchor_batch_size=128,
+               anchor_sketch_size=128, anchor_oversampling=16,
+               anchor_seed=7, anchor_audit=False,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
@@ -172,12 +174,19 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
     before forming their outer product. The fitted tensor remains AO-pair ISDF.
-    `anchor_rank=0` leaves rank to the QR diagonal `anchor_tol`. Anchor indices
-    are relative to the original, unpruned PySCF grid. `space` selects where AO
+    `anchor_rank=0` removes the explicit cap (randomized selection is still
+    capped by its sketch size and physical pair rank). `anchor_tol` is a
+    relative QR-diagonal/max-column cutoff for dense/online selection and a
+    sketch Frobenius cutoff for randomized selection. Anchor indices are
+    relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
-    `anchor_algorithm` is `dense` (LAPACK++/MAGMA, default) or `online`
-    (bounded-batch Kokkos Householder QRCP); `anchor_batch_size` controls the
-    online selector's grid batch. `metric_algorithm="unblocked_greedy"` uses the host integral-direct
+    `anchor_algorithm` is `dense` (default), `online` (direct multipass QRCP),
+    or `randomized` (structured sketch QRCP). `anchor_batch_size` controls
+    streaming; randomized selection uses `anchor_tol` as sketch Frobenius
+    tolerance, `anchor_sketch_size`, `anchor_oversampling`, and `anchor_seed`.
+    `anchor_audit=True` compares actual pair-space projection residuals against
+    dense QRCP at equal rank, only on small problems (not an ID-error audit).
+    `metric_algorithm="unblocked_greedy"` uses the host integral-direct
     Cholesky metric (`metric_tol` is relative to the largest initial ERI
     diagonal); `"unblocked_uniform"` samples pivots uniformly among pairs
     with residual above the cutoff, reproducibly with `metric_seed`.
@@ -220,10 +229,20 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         axis_types = [AXES[axis] if isinstance(axis, str) else axis for axis in axes]
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
-    if anchor_algorithm not in ("dense", "online"):
-        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense' or 'online'")
+    if anchor_algorithm not in ("dense", "online", "randomized"):
+        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense', 'online' or 'randomized'")
     if not isinstance(anchor_batch_size, (int, np.integer)) or anchor_batch_size <= 0:
         raise ValueError("anchor_batch_size must be a positive integer")
+    if (not isinstance(anchor_sketch_size, (int, np.integer)) or
+        not isinstance(anchor_oversampling, (int, np.integer)) or
+        anchor_oversampling < 1 or anchor_sketch_size <= anchor_oversampling or
+        (anchor_algorithm == "randomized" and anchor_rank > 0 and
+         anchor_rank > anchor_sketch_size - anchor_oversampling)):
+        raise ValueError("randomized anchor sketch_size must exceed oversampling and cover oversampling + anchor_rank")
+    if not isinstance(anchor_seed, (int, np.integer)) or not 0 <= anchor_seed < 2**64:
+        raise ValueError("anchor_seed must be an unsigned 64-bit integer")
+    if anchor_audit and anchor_algorithm != "randomized":
+        raise ValueError("anchor_audit requires anchor_algorithm='randomized'")
     if metric_algorithm not in ("grid", "unblocked_greedy", "unblocked_uniform"):
         raise ValueError(f"unknown metric algorithm: {metric_algorithm!r}")
     if not isinstance(metric_seed, (int, np.integer)) or not 0 <= metric_seed < 2**64:
@@ -270,14 +289,19 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         raise ValueError("RHF mean-field object has not converged")
     coefficients = np.ascontiguousarray(mf.mo_coeff) if needs_occ else None
     nocc = mol.nelectron // 2 if needs_occ else 0
-    anchor_choice = (mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting
-                     if anchor_algorithm == "online"
-                     else mp_isdf.LocalAnchorSelectionAlgorithm.QRColumnPivoting)
+    anchor_choices = {
+        "dense": mp_isdf.LocalAnchorSelectionAlgorithm.QRColumnPivoting,
+        "online": mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting,
+        "randomized": mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting,
+    }
+    anchor_choice = anchor_choices[anchor_algorithm]
     anchor_indices = np.asarray(selector.select(
         all_coords, all_weights, axis_types, tolerance=anchor_tol,
         max_rank=anchor_rank, algorithm=anchor_choice,
         mo_coeff=coefficients, nocc=nocc, space=space,
         batch_size=anchor_batch_size, debug=debug,
+        sketch_size=anchor_sketch_size, oversampling=anchor_oversampling,
+        seed=anchor_seed, audit=anchor_audit,
     ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("QRCP found no significant anchors; adjust tolerance or grid")
@@ -482,11 +506,19 @@ def main():
     parser.add_argument("--anchor-rank", type=int, default=0,
                         help="maximum anchor rank (0: tolerance only; default: 0)")
     parser.add_argument("--anchor-tol", type=float, default=1e-10,
-                        help="relative QR diagonal cutoff")
-    parser.add_argument("--anchor-algorithm", choices=("dense", "online"), default="dense",
-                        help="anchor QRCP: dense LAPACK/MAGMA (default) or bounded-batch online Kokkos")
+                        help="relative QR cutoff (sketch Frobenius cutoff for randomized)")
+    parser.add_argument("--anchor-algorithm", choices=("dense", "online", "randomized"), default="dense",
+                        help="anchor QRCP: dense (default), online direct, or randomized sketch")
     parser.add_argument("--anchor-batch-size", type=int, default=128,
-                        help="grid points per AO batch for --anchor-algorithm online")
+                        help="grid points per AO batch for online or randomized anchor selection")
+    parser.add_argument("--anchor-sketch-size", type=int, default=128,
+                        help="randomized sketch rows (default: 128)")
+    parser.add_argument("--anchor-oversampling", type=int, default=16,
+                        help="randomized sketch rows reserved beyond rank cap (default: 16)")
+    parser.add_argument("--anchor-seed", type=int, default=7,
+                        help="randomized anchor seed (default: 7)")
+    parser.add_argument("--anchor-audit", action="store_true",
+                        help="compare randomized pivots to dense QRCP at equal rank (small grids only)")
     parser.add_argument("--axes", default="ao",
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
@@ -519,6 +551,14 @@ def main():
         parser.error("--anchor-rank must be nonnegative")
     if args.anchor_batch_size <= 0:
         parser.error("--anchor-batch-size must be positive")
+    if args.anchor_algorithm == "randomized" and (args.anchor_oversampling < 1 or
+            args.anchor_sketch_size <= args.anchor_oversampling or
+            args.anchor_rank > args.anchor_sketch_size - args.anchor_oversampling):
+        parser.error("randomized sketch size must exceed oversampling and cover oversampling + anchor rank")
+    if not 0 <= args.anchor_seed < 2**64:
+        parser.error("--anchor-seed must be an unsigned 64-bit integer")
+    if args.anchor_audit and args.anchor_algorithm != "randomized":
+        parser.error("--anchor-audit requires --anchor-algorithm randomized")
     if not np.isfinite(args.anchor_tol) or args.anchor_tol < 0:
         parser.error("--anchor-tol must be finite and nonnegative")
     if args.level < 0:
@@ -548,6 +588,9 @@ def main():
                         compute_metric=not args.no_metric, space=args.space,
                         anchor_algorithm=args.anchor_algorithm,
                         anchor_batch_size=args.anchor_batch_size,
+                        anchor_sketch_size=args.anchor_sketch_size,
+                        anchor_oversampling=args.anchor_oversampling,
+                        anchor_seed=args.anchor_seed, anchor_audit=args.anchor_audit,
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         metric_batch_size=args.metric_batch_size,

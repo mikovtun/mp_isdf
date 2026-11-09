@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <variant>
 #include <vector>
 
@@ -14,6 +15,7 @@ namespace isdf {
 
 class QRCPAnchorSelection;
 class OnlineQRAnchorSelection;
+class RandomizedIDAnchorSelection;
 
 #ifdef KOKKOS_ENABLE_CUDA
 using AnchorDeviceSpace = Kokkos::Cuda;
@@ -71,11 +73,14 @@ public:
         const std::vector<double>& mo_coeff = {},
         std::size_t nocc = 0,
         EvaluationSpace space = EvaluationSpace::Auto,
-        std::size_t batch_size = 128, bool debug = false) const;
+        std::size_t batch_size = 128, bool debug = false,
+        std::size_t sketch_size = 128, std::size_t oversampling = 16,
+        std::uint64_t seed = 7, bool audit = false) const;
 
 private:
     friend class QRCPAnchorSelection;
     friend class OnlineQRAnchorSelection;
+    friend class RandomizedIDAnchorSelection;
     struct AxisSpec {
         std::size_t width;
         bool need_ao, need_grad;

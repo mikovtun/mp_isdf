@@ -1,5 +1,6 @@
 #include "anchor_select_qrcp.hpp"
 #include "anchor_select.hpp"
+#include "anchor_select_qrcp_backend.hpp"
 
 #include <Kokkos_Core.hpp>
 #include <lapack.hh>
@@ -28,6 +29,9 @@ void check_product_size(std::size_t nfeatures, std::size_t npoints)
         throw std::overflow_error("pair-product matrix is too large");
     }
 }
+
+} // namespace
+namespace detail {
 
 std::vector<std::int64_t> qrcp_cpu(double* matrix, std::size_t m, std::size_t n)
 {
@@ -86,7 +90,7 @@ std::vector<std::int64_t> qrcp_magma(double* device_matrix, std::size_t m, std::
 }
 #endif
 
-} // namespace
+} // namespace detail
 
 std::vector<std::size_t> QRCPAnchorSelection::select(
     const AnchorSelection& selector,
@@ -192,7 +196,7 @@ std::vector<std::size_t> QRCPAnchorSelection::select_in_space(
     Kokkos::fence();
 #ifdef ISDF_ENABLE_CUDA
     if constexpr (std::is_same_v<Device, Kokkos::Cuda>) {
-        jpvt = qrcp_magma(d_product.data(), m, ng);
+        jpvt = detail::qrcp_magma(d_product.data(), m, ng);
         Kokkos::View<double*, Device> d_diagonal("qr_diagonal", cap);
         Kokkos::parallel_for("isdf_qr_diagonal", Kokkos::RangePolicy<Device>(0, cap),
                              KOKKOS_LAMBDA(const std::size_t i) {
@@ -203,7 +207,7 @@ std::vector<std::size_t> QRCPAnchorSelection::select_in_space(
     } else
 #endif
     {
-        jpvt = qrcp_cpu(d_product.data(), m, ng);
+        jpvt = detail::qrcp_cpu(d_product.data(), m, ng);
         for (std::size_t i = 0; i < cap; ++i) diagonal[i] = d_product(i*m + i);
     }
     const double first = cap ? std::abs(diagonal[0]) : 0.0;
