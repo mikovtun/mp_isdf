@@ -101,8 +101,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     const auto spec = selector.axis_spec(axes, mo_coeff, nocc);
     if (spec.width > std::numeric_limits<std::size_t>::max()/spec.width ||
         spec.width+1 > std::numeric_limits<std::size_t>::max()/spec.width ||
-        sketch_size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-        points.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        sketch_size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
+        points.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
         throw std::overflow_error("randomized ID dimension exceeds supported range");
     std::vector<std::array<double, 3>> kept_points;
     std::vector<double> kept_weights;
@@ -130,21 +130,40 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     if (audit && (d*(d+1)/2 > 2000000/std::max<std::size_t>(1,n)))
         throw std::invalid_argument("randomized ID dense audit is limited to 2 million pair-matrix elements");
     if (n == 0) return {};
-    if (sketch_size > std::numeric_limits<std::size_t>::max()/n ||
-        sketch_size > std::numeric_limits<std::size_t>::max()/std::min(batch_size,n))
-        throw std::overflow_error("randomized ID sketch is too large");
+    // The pair matrix has only d(d+1)/2 independent rows: drawing more
+    // sketch rows cannot increase its rank. Bound dimensions and the total
+    // addressable matrix size to the ILP64 QRCP backend's signed index range.
+    const std::size_t physical_rank = d*(d+1)/2;
+    const std::size_t physical_limit = physical_rank >
+        std::numeric_limits<std::size_t>::max()-oversampling
+        ? std::numeric_limits<std::size_t>::max() : physical_rank+oversampling;
+    const std::size_t backend_limit =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())/n;
+    const std::size_t effective_sketch_size = sketch_size <= backend_limit
+        ? sketch_size : std::min({sketch_size, physical_limit, backend_limit});
+    if (effective_sketch_size <= oversampling ||
+        (max_rank && std::min(max_rank, physical_rank) > effective_sketch_size-oversampling)) {
+        throw std::invalid_argument(
+            "randomized ID sketch/rank exceeds the ILP64 QRCP backend limit for this grid; "
+            "reduce the sketch/rank or use a tiled QRCP backend");
+    }
+    if (effective_sketch_size != sketch_size) {
+        std::cerr << "[randomized id] sketch_size reduced from " << sketch_size
+                  << " to " << effective_sketch_size
+                  << " (ILP64 addressability/physical pair dimension; using physical pair rank + oversampling when possible)\n";
+    }
     if (space == EvaluationSpace::Host)
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
             kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
-            batch_size, debug, sketch_size, oversampling, seed, audit);
+            batch_size, debug, effective_sketch_size, oversampling, seed, audit);
 #ifdef ISDF_ENABLE_CUDA
     return select_in_space<Kokkos::Cuda>(selector, kept_points, kept_weights,
         original, axes, tolerance, max_rank, mo_coeff, nocc,
-        batch_size, debug, sketch_size, oversampling, seed, audit);
+        batch_size, debug, effective_sketch_size, oversampling, seed, audit);
 #else
     return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
         kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
-        batch_size, debug, sketch_size, oversampling, seed, audit);
+        batch_size, debug, effective_sketch_size, oversampling, seed, audit);
 #endif
 }
 
@@ -183,7 +202,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         for (std::size_t g = 0; g < count; ++g) hw(g) = std::sqrt(std::abs(weights[start+g]));
         Kokkos::deep_copy(sw, hw);
         const double scaling = 1/std::sqrt(static_cast<double>(ell));
-        Kokkos::parallel_for("id_factored_sketch", Kokkos::RangePolicy<Space>(0,count*ell),
+        using SketchPolicy = Kokkos::RangePolicy<Space, Kokkos::IndexType<std::size_t>>;
+        Kokkos::parallel_for("id_factored_sketch", SketchPolicy(0,count*ell),
             KOKKOS_LAMBDA(const std::size_t i) {
                 const std::size_t g = i/ell, s = i%ell;
                 double left = 0, right = 0;
@@ -194,10 +214,12 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
                 }
                 y((start+g)*ell+s) = scaling*sw(g)*left*right;
             });
-        int bad = 0;
-        Kokkos::parallel_reduce("id_check_sketch", Kokkos::RangePolicy<Space>(start*ell,(start+count)*ell),
-            KOKKOS_LAMBDA(const std::size_t i, int& invalid) {
-                if (!Kokkos::isfinite(y(i))) ++invalid;
+        std::size_t bad = 0;
+        // Check this batch using local indices. Absolute sketch offsets can
+        // exceed INT_MAX even when a bounded batch is small (e.g. 50k x 43k).
+        Kokkos::parallel_reduce("id_check_sketch", SketchPolicy(0,count*ell),
+            KOKKOS_LAMBDA(const std::size_t i, std::size_t& invalid) {
+                if (!Kokkos::isfinite(y(start*ell+i))) ++invalid;
             }, bad);
         if (bad) throw std::overflow_error("non-finite randomized ID sketch");
     }

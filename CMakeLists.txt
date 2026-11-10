@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.22)
 project(mp_isdf LANGUAGES CXX)
 
 option(ISDF_ENABLE_MPI "Enable MPI support" ON)
@@ -43,12 +43,27 @@ if(ISDF_ENABLE_OPENMP)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
 endif()
 
+# The large randomized sketch path needs 64-bit BLAS/LAPACK integer ABIs.
+# BLAS++ uses this cache option for its C++ wrappers; FindLAPACK uses BLA_*
+# when MAGMA and LAPACK++ locate the Fortran backend.
+set(blas_int "int64_t (ILP64)" CACHE STRING "BLAS integer size" FORCE)
+set(use_cmake_find_lapack ON CACHE BOOL "Use CMake FindLAPACK for ILP64 selection" FORCE)
+set(BLA_SIZEOF_INTEGER 8 CACHE STRING "Require ILP64 BLAS/LAPACK integers" FORCE)
+# Select a known ILP64 MKL interface where available instead of allowing
+# BLAS++'s generic finder to pair an integer-width-ambiguous BLAS with ILP64 LAPACK.
+set(BLA_VENDOR Intel10_64ilp_seq CACHE STRING "Select ILP64 MKL BLAS/LAPACK" FORCE)
 FetchContent_MakeAvailable(blaspp lapackpp)
 # The embedded LAPACK++ configuration can omit the Fortran symbol-mangling
-# definition when a vendor BLAS/LAPACK is found via CMake. Our LP64 libraries
-# use the conventional trailing-underscore symbols.
-target_compile_definitions(lapackpp PUBLIC LAPACK_FORTRAN_ADD_)
+# definition when a vendor BLAS/LAPACK is found via CMake. ILP64 libraries
+# retain the conventional trailing-underscore symbols.
+target_compile_definitions(lapackpp PUBLIC LAPACK_FORTRAN_ADD_ LAPACK_ILP64)
 target_compile_definitions(blaspp PUBLIC BLAS_FORTRAN_ADD_)
+# Some BLAS++ CMake finder paths generate BLAS_ILP64 in defines.h, while
+# cached CMake-FindBLAS configurations may omit it. Ensure ABI declarations
+# are 64-bit in either case without redefining a generated header macro.
+if(NOT "-DBLAS_ILP64" IN_LIST blaspp_defines)
+    target_compile_definitions(blaspp PUBLIC BLAS_ILP64)
+endif()
 
 # SLATE enables its test suite by default when embedded as a dependency;
 # those tests require source-tree-only headers and are not needed here.
@@ -86,10 +101,26 @@ if(ISDF_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS CXX)
 endif()
 
+find_package(LAPACK REQUIRED)
+if(NOT BLA_SIZEOF_INTEGER STREQUAL "8")
+    message(WARNING "LAPACK was not configured with the requested ILP64 integer ABI; "
+                    "large-matrix indices may be limited to 32-bit offsets")
+endif()
+include(CheckCXXSourceRuns)
+set(CMAKE_REQUIRED_LIBRARIES ${LAPACK_LIBRARIES})
+    check_cxx_source_runs("extern \"C\" void dgesv_(long long*, long long*, double*, long long*, long long*, double*, long long*, long long*);\nint main() { long long n=2,nrhs=1,lda=2,ldb=2,ipiv[2]={0,0},info=-999; double a[4]={2,1,1,3},b[2]={1,2}; dgesv_(&n,&nrhs,a,&lda,ipiv,b,&ldb,&info); return !(info==0 && b[0]>0.19 && b[0]<0.21 && b[1]>0.59 && b[1]<0.61); }"
+    ISDF_LAPACK_ILP64_ABI_WORKS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT ISDF_LAPACK_ILP64_ABI_WORKS)
+    message(WARNING "Could not verify the linked LAPACK ILP64 ABI at configure time. "
+                    "Ensure that the selected library really uses 64-bit Fortran integers; "
+                    "otherwise large QRCP matrices are unsafe.")
+else()
+    message(STATUS "Verified LAPACK ILP64 integer ABI")
+endif()
+
 if(ISDF_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
-    find_package(LAPACK REQUIRED)
-
     # MAGMA uses CMAKE_SOURCE_DIR internally, so it must be configured as a
     # standalone project rather than added with FetchContent_MakeAvailable.
     include(ExternalProject)
@@ -103,11 +134,15 @@ if(ISDF_ENABLE_CUDA)
             set(ISDF_MAGMA_GENERATE_ARCH "sm_${CMAKE_MATCH_1}")
         endif()
     endif()
+    # Pass the exact ILP64 LAPACK chosen above through to MAGMA's standalone
+    # configure; otherwise its independent FindLAPACK can silently select LP64.
+    string(REPLACE ";" "|" ISDF_MAGMA_LAPACK_LIBRARIES "${LAPACK_LIBRARIES}")
     set(ISDF_MAGMA_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/magma-src")
     set(ISDF_MAGMA_BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/magma-build")
     set(ISDF_MAGMA_LIBRARY "${ISDF_MAGMA_BINARY_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}magma${CMAKE_STATIC_LIBRARY_SUFFIX}")
     file(MAKE_DIRECTORY "${ISDF_MAGMA_SOURCE_DIR}/include" "${ISDF_MAGMA_BINARY_DIR}/include")
     ExternalProject_Add(magma_external
+        LIST_SEPARATOR "|"
         GIT_REPOSITORY https://github.com/icl-utk-edu/magma.git
         GIT_TAG v2.10.0
         GIT_SHALLOW TRUE
@@ -123,6 +158,10 @@ if(ISDF_ENABLE_CUDA)
             -DUSE_FORTRAN=OFF
             -DBUILD_SHARED_LIBS=OFF
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            -DCMAKE_C_FLAGS=-DMAGMA_ILP64
+            -DCMAKE_CXX_FLAGS=-DMAGMA_ILP64
+            -DCMAKE_CUDA_FLAGS=-DMAGMA_ILP64
+            -DLAPACK_LIBRARIES:STRING=${ISDF_MAGMA_LAPACK_LIBRARIES}
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target magma
         INSTALL_COMMAND ""
         BUILD_BYPRODUCTS "${ISDF_MAGMA_LIBRARY}"
@@ -131,6 +170,7 @@ if(ISDF_ENABLE_CUDA)
     set_target_properties(isdf_magma PROPERTIES
         IMPORTED_LOCATION "${ISDF_MAGMA_LIBRARY}"
         INTERFACE_INCLUDE_DIRECTORIES "${ISDF_MAGMA_SOURCE_DIR}/include;${ISDF_MAGMA_BINARY_DIR}/include"
+        INTERFACE_COMPILE_DEFINITIONS MAGMA_ILP64
     )
     add_dependencies(isdf_magma magma_external)
     target_link_libraries(isdf_magma INTERFACE
