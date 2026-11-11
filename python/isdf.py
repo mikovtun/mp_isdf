@@ -191,7 +191,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     clustering and snapping.
     `anchor_batch_size` controls
     streaming; randomized selection uses `anchor_tol` as sketch Frobenius
-    tolerance, `anchor_sketch_size`, `anchor_oversampling`, and `anchor_seed`.
+    tolerance and `anchor_seed`. With an explicit rank, sketch rows equal
+    `anchor_rank + anchor_oversampling`; otherwise `anchor_sketch_size` sets
+    the sketch rows (and `sketch_size - oversampling` caps the rank).
     `anchor_audit=True` compares actual pair-space projection residuals against
     dense QRCP at equal rank, only on small problems (not an ID-error audit).
     `metric_algorithm="unblocked_greedy"` uses the host integral-direct
@@ -249,10 +251,10 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         raise ValueError("anchor_batch_size must be a positive integer")
     if (not isinstance(anchor_sketch_size, (int, np.integer)) or
         not isinstance(anchor_oversampling, (int, np.integer)) or
-        anchor_oversampling < 1 or anchor_sketch_size <= anchor_oversampling or
-        (anchor_algorithm == "randomized" and anchor_rank > 0 and
-         anchor_rank > anchor_sketch_size - anchor_oversampling)):
-        raise ValueError("randomized anchor sketch_size must exceed oversampling and cover oversampling + anchor_rank")
+        anchor_oversampling < 1 or anchor_sketch_size < 1 or
+        (anchor_algorithm == "randomized" and anchor_rank == 0 and
+         anchor_sketch_size <= anchor_oversampling)):
+        raise ValueError("randomized anchor sketch_size must exceed oversampling when anchor_rank=0")
     if not isinstance(anchor_seed, (int, np.integer)) or not 0 <= anchor_seed < 2**64:
         raise ValueError("anchor_seed must be an unsigned 64-bit integer")
     if anchor_audit and anchor_algorithm != "randomized":
@@ -545,9 +547,9 @@ def main():
     parser.add_argument("--anchor-batch-size", type=int, default=128,
                         help="grid points per AO batch for online or randomized anchor selection")
     parser.add_argument("--anchor-sketch-size", type=int, default=128,
-                        help="randomized sketch rows (default: 128)")
+                        help="randomized sketch rows when --anchor-rank=0 (default: 128)")
     parser.add_argument("--anchor-oversampling", type=int, default=16,
-                        help="randomized sketch rows reserved beyond rank cap (default: 16)")
+                        help="randomized extra sketch rows beyond explicit rank (default: 16)")
     parser.add_argument("--anchor-seed", type=int, default=7,
                         help="randomized/CVT anchor seed (default: 7)")
     parser.add_argument("--cvt-weight", choices=("electron_density", "quadrature_weights"),
@@ -594,10 +596,10 @@ def main():
         parser.error("--cvt-max-iter must be positive and --cvt-tol finite and nonnegative")
     if args.anchor_batch_size <= 0:
         parser.error("--anchor-batch-size must be positive")
-    if args.anchor_algorithm == "randomized" and (args.anchor_oversampling < 1 or
-            args.anchor_sketch_size <= args.anchor_oversampling or
-            args.anchor_rank > args.anchor_sketch_size - args.anchor_oversampling):
-        parser.error("randomized sketch size must exceed oversampling and cover oversampling + anchor rank")
+    if args.anchor_sketch_size < 1 or args.anchor_oversampling < 1 or (
+            args.anchor_algorithm == "randomized" and args.anchor_rank == 0 and
+            args.anchor_sketch_size <= args.anchor_oversampling):
+        parser.error("randomized sketch size must exceed oversampling when --anchor-rank=0")
     if not 0 <= args.anchor_seed < 2**64:
         parser.error("--anchor-seed must be an unsigned 64-bit integer")
     if args.anchor_audit and args.anchor_algorithm != "randomized":

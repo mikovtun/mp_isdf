@@ -95,13 +95,18 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     std::uint64_t seed, bool audit)
 {
     if (points.size() != weights.size() || !std::isfinite(tolerance) || tolerance < 0 ||
-        batch_size == 0 || oversampling == 0 || sketch_size <= oversampling ||
-        (max_rank && max_rank > sketch_size-oversampling))
+        batch_size == 0 || oversampling == 0 ||
+        (!max_rank && sketch_size <= oversampling))
         throw std::invalid_argument("invalid randomized ID grid, tolerance, batch, sketch or rank/oversampling");
     const auto spec = selector.axis_spec(axes, mo_coeff, nocc);
+    if (max_rank > std::numeric_limits<std::size_t>::max()-oversampling)
+        throw std::overflow_error("randomized ID rank + oversampling overflows size_t");
+    // For an explicit rank the requested sketch has exactly rank + oversampling
+    // rows. sketch_size remains the fallback for tolerance-only selection.
+    const std::size_t requested_sketch_size = max_rank ? max_rank+oversampling : sketch_size;
     if (spec.width > std::numeric_limits<std::size_t>::max()/spec.width ||
         spec.width+1 > std::numeric_limits<std::size_t>::max()/spec.width ||
-        sketch_size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
+        requested_sketch_size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
         points.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
         throw std::overflow_error("randomized ID dimension exceeds supported range");
     std::vector<std::array<double, 3>> kept_points;
@@ -139,16 +144,16 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
         ? std::numeric_limits<std::size_t>::max() : physical_rank+oversampling;
     const std::size_t backend_limit =
         static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())/n;
-    const std::size_t effective_sketch_size = sketch_size <= backend_limit
-        ? sketch_size : std::min({sketch_size, physical_limit, backend_limit});
+    const std::size_t effective_sketch_size = requested_sketch_size <= backend_limit
+        ? requested_sketch_size : std::min({requested_sketch_size, physical_limit, backend_limit});
     if (effective_sketch_size <= oversampling ||
         (max_rank && std::min(max_rank, physical_rank) > effective_sketch_size-oversampling)) {
         throw std::invalid_argument(
             "randomized ID sketch/rank exceeds the ILP64 QRCP backend limit for this grid; "
             "reduce the sketch/rank or use a tiled QRCP backend");
     }
-    if (effective_sketch_size != sketch_size) {
-        std::cerr << "[randomized id] sketch_size reduced from " << sketch_size
+    if (effective_sketch_size != requested_sketch_size) {
+        std::cerr << "[randomized id] sketch_size reduced from " << requested_sketch_size
                   << " to " << effective_sketch_size
                   << " (ILP64 addressability/physical pair dimension; using physical pair rank + oversampling when possible)\n";
     }

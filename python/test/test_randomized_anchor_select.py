@@ -74,7 +74,13 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
 
     def test_validations_and_optional_audit(self):
         self.assertEqual(len(self.select(space="host", max_rank=2, audit=True)), 2)
-        for kw in ({"max_rank": 10}, {"batch_size": 0}, {"oversampling": 0}):
+        # Explicit rank determines sketch rows independently of sketch_size.
+        explicit = self.selector.select(
+            self.points, self.weights, self.axis,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting,
+            sketch_size=2, oversampling=3, max_rank=3, seed=31, space="host")
+        self.assertEqual(explicit, self.select(space="host", max_rank=3))
+        for kw in ({"batch_size": 0}, {"oversampling": 0}):
             opts = dict(kw)
             if "oversampling" in opts:
                 with self.assertRaises(ValueError):
