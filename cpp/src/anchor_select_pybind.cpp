@@ -74,7 +74,8 @@ void bind_anchor_select(py::module_& m)
     py::enum_<LocalAnchorSelectionAlgorithm>(m, "LocalAnchorSelectionAlgorithm")
         .value("QRColumnPivoting", LocalAnchorSelectionAlgorithm::QRColumnPivoting)
         .value("OnlineQRColumnPivoting", LocalAnchorSelectionAlgorithm::OnlineQRColumnPivoting)
-        .value("RandomizedQRColumnPivoting", LocalAnchorSelectionAlgorithm::RandomizedQRColumnPivoting);
+        .value("RandomizedQRColumnPivoting", LocalAnchorSelectionAlgorithm::RandomizedQRColumnPivoting)
+        .value("CentroidalVoronoi", LocalAnchorSelectionAlgorithm::CentroidalVoronoi);
     py::enum_<DistributedAnchorSelectionAlgorithm>(m, "DistributedAnchorSelectionAlgorithm")
         .value("SVD", DistributedAnchorSelectionAlgorithm::SVD)
         .value("RandomizedQRColumnPivoting", DistributedAnchorSelectionAlgorithm::RandomizedQRColumnPivoting);
@@ -89,17 +90,26 @@ void bind_anchor_select(py::module_& m)
                           py::object mo_coeff, std::size_t nocc,
                           const std::string& space, std::size_t batch_size, bool debug,
                           std::size_t sketch_size, std::size_t oversampling,
-                          std::uint64_t seed, bool audit) {
+                          std::uint64_t seed, bool audit, py::object cvt_weights,
+                          std::size_t cvt_max_iter, double cvt_tol) {
             auto grid = read_points(points);
             if (weights.ndim() != 1 || weights.shape(0) != points.shape(0))
                 throw std::invalid_argument("expected weights[ngrid]");
             auto axis_list = read_axes(axes);
             auto coefficients = read_coefficients(selector, mo_coeff);
             std::vector<double> w(weights.data(), weights.data() + weights.size());
+            std::vector<double> density;
+            if (!cvt_weights.is_none()) {
+                auto input = cvt_weights.cast<FloatArray>();
+                if (input.ndim() != 1 || input.shape(0) != points.shape(0))
+                    throw std::invalid_argument("cvt_weights must have shape (ngrid,)");
+                density.assign(input.data(), input.data() + input.size());
+            }
             return selector.select(grid, w, axis_list, tolerance, max_rank,
                                    algorithm, coefficients, nocc,
                                    parse_evaluation_space(space), batch_size, debug,
-                                   sketch_size, oversampling, seed, audit);
+                                   sketch_size, oversampling, seed, audit,
+                                   density, cvt_max_iter, cvt_tol);
         }, py::arg("points"), py::arg("weights"), py::arg("axes"),
            py::arg("tolerance") = 1e-10, py::arg("max_rank") = 0,
            py::arg("algorithm") = LocalAnchorSelectionAlgorithm::QRColumnPivoting,
@@ -108,7 +118,9 @@ void bind_anchor_select(py::module_& m)
            py::arg("debug") = false,
            py::arg("sketch_size") = 128, py::arg("oversampling") = 16,
            py::arg("seed") = 7, py::arg("audit") = false,
-           "Select original grid indices in pivot order (QRCP on weighted pair-product transpose).")
+           py::arg("cvt_weights") = py::none(), py::arg("cvt_max_iter") = 100,
+           py::arg("cvt_tol") = 1e-5,
+           "Select original grid indices: QRCP returns pivot order; CVT returns sorted, distinct grid sites. CVT requires max_rank and cvt_weights (density or absolute quadrature weights).")
         .def("evaluate_axis", [](const isdf::AnchorSelection& selector,
                                   const FloatArray& points, py::object axes,
                                   py::object mo_coeff, std::size_t nocc,

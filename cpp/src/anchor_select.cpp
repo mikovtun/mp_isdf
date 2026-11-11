@@ -2,6 +2,7 @@
 #include "anchor_select_qrcp.hpp"
 #include "anchor_select_online_qr.hpp"
 #include "anchor_select_randomized_id.hpp"
+#include "anchor_select_cvt.hpp"
 
 #include <Kokkos_Core.hpp>
 
@@ -83,7 +84,8 @@ std::vector<std::size_t> AnchorSelection::select(
     LocalAnchorSelectionAlgorithm algorithm,
     const std::vector<double>& mo_coeff,
     std::size_t nocc, EvaluationSpace space, std::size_t batch_size, bool debug,
-    std::size_t sketch_size, std::size_t oversampling, std::uint64_t seed, bool audit) const
+    std::size_t sketch_size, std::size_t oversampling, std::uint64_t seed, bool audit,
+    const std::vector<double>& cvt_weights, std::size_t cvt_max_iter, double cvt_tol) const
 {
     switch (algorithm) {
     case LocalAnchorSelectionAlgorithm::QRColumnPivoting:
@@ -96,8 +98,11 @@ std::vector<std::size_t> AnchorSelection::select(
         return RandomizedIDAnchorSelection::select(*this, points, weights, axes, tolerance,
             max_rank, mo_coeff, nocc, space, batch_size, debug,
             sketch_size, oversampling, seed, audit);
+    case LocalAnchorSelectionAlgorithm::CentroidalVoronoi:
+        return CVTAnchorSelection::select(points, weights, cvt_weights, max_rank,
+                                          space, seed, cvt_max_iter, cvt_tol, debug);
     default:
-        throw std::logic_error("randomized QRCP is not implemented");
+        throw std::invalid_argument("unknown anchor selection algorithm");
     }
 }
 

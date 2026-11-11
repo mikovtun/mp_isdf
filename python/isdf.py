@@ -166,6 +166,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
                anchor_algorithm="dense", anchor_batch_size=128,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
+               cvt_weight="electron_density", cvt_max_iter=100, cvt_tol=1e-5,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
@@ -181,7 +182,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
     relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
     `anchor_algorithm` is `dense` (default), `online` (direct multipass QRCP),
-    or `randomized` (structured sketch QRCP). `anchor_batch_size` controls
+    `randomized` (structured sketch QRCP), or `cvt` (density-weighted
+    centroidal Voronoi). CVT requires a positive `anchor_rank`; it ignores
+    `anchor_tol` and `axes`, uses `anchor_seed`, `cvt_max_iter`, and `cvt_tol`,
+    and uses either spin-summed RKS B3LYP electron density (default) or
+    absolute quadrature weights as its importance vector, not their product.
+    Zero quadrature-weight and zero-importance sites are excluded from
+    clustering and snapping.
+    `anchor_batch_size` controls
     streaming; randomized selection uses `anchor_tol` as sketch Frobenius
     tolerance, `anchor_sketch_size`, `anchor_oversampling`, and `anchor_seed`.
     `anchor_audit=True` compares actual pair-space projection residuals against
@@ -229,8 +237,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         axis_types = [AXES[axis] if isinstance(axis, str) else axis for axis in axes]
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
-    if anchor_algorithm not in ("dense", "online", "randomized"):
-        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense', 'online' or 'randomized'")
+    if anchor_algorithm not in ("dense", "online", "randomized", "cvt"):
+        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense', 'online', 'randomized' or 'cvt'")
+    if cvt_weight not in ("electron_density", "quadrature_weights"):
+        raise ValueError("cvt_weight must be 'electron_density' or 'quadrature_weights'")
+    if not isinstance(cvt_max_iter, (int, np.integer)) or cvt_max_iter < 1 or not np.isfinite(cvt_tol) or cvt_tol < 0:
+        raise ValueError("cvt_max_iter must be positive and cvt_tol finite and nonnegative")
+    if anchor_algorithm == "cvt" and anchor_rank < 1:
+        raise ValueError("CVT requires a positive anchor_rank")
     if not isinstance(anchor_batch_size, (int, np.integer)) or anchor_batch_size <= 0:
         raise ValueError("anchor_batch_size must be a positive integer")
     if (not isinstance(anchor_sketch_size, (int, np.integer)) or
@@ -293,8 +307,26 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         "dense": mp_isdf.LocalAnchorSelectionAlgorithm.QRColumnPivoting,
         "online": mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting,
         "randomized": mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQRColumnPivoting,
+        "cvt": mp_isdf.LocalAnchorSelectionAlgorithm.CentroidalVoronoi,
     }
     anchor_choice = anchor_choices[anchor_algorithm]
+    cvt_weights = None
+    if anchor_algorithm == "cvt":
+        cvt_weights = np.zeros(len(all_coords), dtype=np.float64)
+        if cvt_weight == "quadrature_weights":
+            cvt_weights[keep] = np.abs(all_weights[keep])
+        else:
+            rks = dft.RKS(mol)
+            rks.xc = "b3lyp"
+            rks.grids.level = level
+            rks.kernel()
+            if not rks.converged:
+                raise RuntimeError("RKS B3LYP did not converge for CVT density")
+            # Spin-summed electron density on the same PySCF grid as selection.
+            ao_cvt = dft.numint.eval_ao(mol, all_coords[keep])
+            cvt_weights[keep] = np.maximum(
+                dft.numint.eval_rho(mol, ao_cvt, rks.make_rdm1()), 0.0)
+        record("cvt_weights")
     anchor_indices = np.asarray(selector.select(
         all_coords, all_weights, axis_types, tolerance=anchor_tol,
         max_rank=anchor_rank, algorithm=anchor_choice,
@@ -302,9 +334,10 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=1e-10,
         batch_size=anchor_batch_size, debug=debug,
         sketch_size=anchor_sketch_size, oversampling=anchor_oversampling,
         seed=anchor_seed, audit=anchor_audit,
+        cvt_weights=cvt_weights, cvt_max_iter=cvt_max_iter, cvt_tol=cvt_tol,
     ), dtype=np.intp)
     if len(anchor_indices) == 0:
-        raise ValueError("QRCP found no significant anchors; adjust tolerance or grid")
+        raise ValueError("anchor selection found no anchors; adjust settings or grid")
     record("anchor_selection")
     if selection_only:
         return {
@@ -507,8 +540,8 @@ def main():
                         help="maximum anchor rank (0: tolerance only; default: 0)")
     parser.add_argument("--anchor-tol", type=float, default=1e-10,
                         help="relative QR cutoff (sketch Frobenius cutoff for randomized)")
-    parser.add_argument("--anchor-algorithm", choices=("dense", "online", "randomized"), default="dense",
-                        help="anchor QRCP: dense (default), online direct, or randomized sketch")
+    parser.add_argument("--anchor-algorithm", choices=("dense", "online", "randomized", "cvt"), default="dense",
+                        help="anchor selection: dense (default), online, randomized, or CVT")
     parser.add_argument("--anchor-batch-size", type=int, default=128,
                         help="grid points per AO batch for online or randomized anchor selection")
     parser.add_argument("--anchor-sketch-size", type=int, default=128,
@@ -516,13 +549,19 @@ def main():
     parser.add_argument("--anchor-oversampling", type=int, default=16,
                         help="randomized sketch rows reserved beyond rank cap (default: 16)")
     parser.add_argument("--anchor-seed", type=int, default=7,
-                        help="randomized anchor seed (default: 7)")
+                        help="randomized/CVT anchor seed (default: 7)")
+    parser.add_argument("--cvt-weight", choices=("electron_density", "quadrature_weights"),
+                        default="electron_density",
+                        help="CVT importance: RKS B3LYP electron density or absolute quadrature weights")
+    parser.add_argument("--cvt-max-iter", type=int, default=100)
+    parser.add_argument("--cvt-tol", type=float, default=1e-5,
+                        help="CVT relative centroid-shift stopping tolerance")
     parser.add_argument("--anchor-audit", action="store_true",
                         help="compare randomized pivots to dense QRCP at equal rank (small grids only)")
     parser.add_argument("--axes", default="ao",
                         help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
-                        help="where AO evaluation and QRCP run")
+                        help="where AO evaluation and anchor selection run")
     parser.add_argument("--metric", choices=("unblocked_greedy", "unblocked_uniform", "grid"),
                         default="unblocked_greedy",
                         help="Coulomb metric algorithm (default: unblocked_greedy)")
@@ -549,6 +588,10 @@ def main():
     args = parser.parse_args()
     if args.anchor_rank < 0:
         parser.error("--anchor-rank must be nonnegative")
+    if args.anchor_algorithm == "cvt" and args.anchor_rank == 0:
+        parser.error("--anchor-algorithm cvt requires --anchor-rank > 0")
+    if args.cvt_max_iter < 1 or not np.isfinite(args.cvt_tol) or args.cvt_tol < 0:
+        parser.error("--cvt-max-iter must be positive and --cvt-tol finite and nonnegative")
     if args.anchor_batch_size <= 0:
         parser.error("--anchor-batch-size must be positive")
     if args.anchor_algorithm == "randomized" and (args.anchor_oversampling < 1 or
@@ -591,6 +634,8 @@ def main():
                         anchor_sketch_size=args.anchor_sketch_size,
                         anchor_oversampling=args.anchor_oversampling,
                         anchor_seed=args.anchor_seed, anchor_audit=args.anchor_audit,
+                        cvt_weight=args.cvt_weight, cvt_max_iter=args.cvt_max_iter,
+                        cvt_tol=args.cvt_tol,
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
                         metric_rank=args.metric_rank,
                         metric_batch_size=args.metric_batch_size,

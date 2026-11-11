@@ -75,7 +75,9 @@ public:
         EvaluationSpace space = EvaluationSpace::Auto,
         std::size_t batch_size = 128, bool debug = false,
         std::size_t sketch_size = 128, std::size_t oversampling = 16,
-        std::uint64_t seed = 7, bool audit = false) const;
+        std::uint64_t seed = 7, bool audit = false,
+        const std::vector<double>& cvt_weights = {},
+        std::size_t cvt_max_iter = 100, double cvt_tol = 1e-5) const;
 
 private:
     friend class QRCPAnchorSelection;
