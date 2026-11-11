@@ -92,8 +92,11 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     const std::vector<double>& mo_coeff, std::size_t nocc,
     EvaluationSpace space, std::size_t batch_size, bool debug,
     std::size_t sketch_size, std::size_t oversampling,
-    std::uint64_t seed, bool audit)
+    std::uint64_t seed, bool audit, bool positive_ao_quadrature)
 {
+    if (positive_ao_quadrature &&
+        (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
+        throw std::invalid_argument("quadrature Khatri-Rao sketch requires axes=(ao,)");
     if (points.size() != weights.size() || !std::isfinite(tolerance) || tolerance < 0 ||
         batch_size == 0 || oversampling == 0 ||
         (!max_rank && sketch_size <= oversampling))
@@ -117,6 +120,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     original.reserve(points.size());
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (!std::isfinite(weights[i])) throw std::invalid_argument("grid weights must be finite");
+        if (positive_ao_quadrature && weights[i] < 0)
+            throw std::invalid_argument("quadrature Khatri-Rao sketch requires nonnegative grid weights");
         if (weights[i] == 0) continue;
         for (double x : points[i])
             if (!std::isfinite(x)) throw std::invalid_argument("grid coordinates must be finite");
@@ -160,15 +165,18 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     if (space == EvaluationSpace::Host)
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
             kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
-            batch_size, debug, effective_sketch_size, oversampling, seed, audit);
+            batch_size, debug, effective_sketch_size, oversampling, seed, audit,
+            positive_ao_quadrature);
 #ifdef ISDF_ENABLE_CUDA
     return select_in_space<Kokkos::Cuda>(selector, kept_points, kept_weights,
         original, axes, tolerance, max_rank, mo_coeff, nocc,
-        batch_size, debug, effective_sketch_size, oversampling, seed, audit);
+        batch_size, debug, effective_sketch_size, oversampling, seed, audit,
+        positive_ao_quadrature);
 #else
     return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
         kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
-        batch_size, debug, effective_sketch_size, oversampling, seed, audit);
+        batch_size, debug, effective_sketch_size, oversampling, seed, audit,
+        positive_ao_quadrature);
 #endif
 }
 
@@ -180,7 +188,7 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
     const std::vector<AxisType>& axes, double tolerance, std::size_t max_rank,
     const std::vector<double>& mo_coeff, std::size_t nocc,
     std::size_t batch_size, bool debug, std::size_t ell, std::size_t oversampling,
-    std::uint64_t seed, bool audit)
+    std::uint64_t seed, bool audit, bool positive_ao_quadrature)
 {
     const auto started = std::chrono::steady_clock::now();
     const std::size_t d = selector.axis_spec(axes, mo_coeff, nocc).width;
@@ -204,7 +212,10 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         auto phi = axis.values;
         Kokkos::View<double*, Space> sw("id_weights", count);
         auto hw = Kokkos::create_mirror_view(sw);
-        for (std::size_t g = 0; g < count; ++g) hw(g) = std::sqrt(std::abs(weights[start+g]));
+        // Positive AO mode uses sqrt(w); the feature mode retains sqrt(abs(w)).
+        for (std::size_t g = 0; g < count; ++g)
+            hw(g) = std::sqrt(positive_ao_quadrature ? weights[start+g]
+                                                     : std::abs(weights[start+g]));
         Kokkos::deep_copy(sw, hw);
         const double scaling = 1/std::sqrt(static_cast<double>(ell));
         using SketchPolicy = Kokkos::RangePolicy<Space, Kokkos::IndexType<std::size_t>>;
@@ -267,9 +278,15 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
     const std::size_t physical_rank = d*(d+1)/2;
     const std::size_t cap = std::min({max_rank ? max_rank : ell-oversampling,
                                       ell-oversampling, steps, physical_rank, numerical_rank});
-    std::size_t rank = cap;
-    for (std::size_t i = 0; i <= cap; ++i) {
-        if (tails[i] <= tolerance*norm) { rank = i; break; }
+    if (max_rank && numerical_rank < max_rank)
+        throw std::invalid_argument("requested anchor_rank exceeds the numerical rank of the randomized sketch");
+    // A positive max_rank is an exact requested rank. Tolerance stopping is
+    // used only in tolerance-driven mode (max_rank == 0).
+    std::size_t rank = max_rank ? max_rank : cap;
+    if (!max_rank) {
+        for (std::size_t i = 0; i <= cap; ++i) {
+            if (tails[i] <= tolerance*norm) { rank = i; break; }
+        }
     }
     std::vector<std::size_t> selected;
     selected.reserve(rank);
@@ -279,7 +296,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         selected.push_back(original[static_cast<std::size_t>(jpvt[i]-1)]);
     }
     if (debug) {
-        std::cerr << "[randomized id] rank=" << rank << " sketch_size=" << ell
+        std::cerr << (positive_ao_quadrature ? "[rand_ao_kr_quadrature]" : "[rand_feature_kr]")
+                  << " rank=" << rank << " sketch_size=" << ell
                   << " oversampling=" << oversampling << " columns=" << n
                   << " sketch_relative_frobenius=" << (norm ? tails[rank]/norm : 0)
                   << " tolerance_met=" << (tails[rank] <= tolerance*norm)

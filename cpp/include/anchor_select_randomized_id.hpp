@@ -4,7 +4,8 @@
 
 namespace isdf {
 
-// Structured randomized sketch followed by dense QRCP of the SKETCH.
+// Two policies share the factored Gaussian Khatri-Rao sketch and sketch QRCP:
+// general axis features with abs(weights), or AO-only positive quadrature weights.
 // Pivots only: the packed sketch QR and its upper triangular R are the
 // natural continuation point for future ID coefficients X = R11^{-1} R1:.
 class RandomizedIDAnchorSelection {
@@ -17,7 +18,7 @@ public:
         const std::vector<double>& mo_coeff, std::size_t nocc,
         EvaluationSpace space, std::size_t batch_size, bool debug,
         std::size_t sketch_size, std::size_t oversampling,
-        std::uint64_t seed, bool audit);
+        std::uint64_t seed, bool audit, bool positive_ao_quadrature = false);
 
     // Public because CUDA extended lambdas require a public enclosing function.
     template <class Space>
@@ -30,6 +31,7 @@ public:
         double tolerance, std::size_t max_rank,
         const std::vector<double>& mo_coeff, std::size_t nocc,
         std::size_t batch_size, bool debug, std::size_t sketch_size,
-        std::size_t oversampling, std::uint64_t seed, bool audit);
+        std::size_t oversampling, std::uint64_t seed, bool audit,
+        bool positive_ao_quadrature);
 };
 } // namespace isdf

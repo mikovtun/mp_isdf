@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from pyscf import dft, gto, scf
@@ -203,6 +204,13 @@ class TestMinimalISDF(unittest.TestCase):
             evaluate_isdf_jk(result, np.array([[1., 1.], [0., 1.]]))
         with self.assertRaisesRegex(ValueError, "metric"):
             evaluate_isdf_jk({**result, "coulomb_metric": None}, dm)
+
+    def test_cli_rejects_anchor_rank_and_tolerance_together(self):
+        from isdf import main
+        with patch("sys.argv", ["isdf.py", "--anchor-rank", "2", "--anchor-tol", "1e-6"]):
+            with self.assertRaises(SystemExit) as error:
+                main()
+        self.assertEqual(error.exception.code, 2)
 
     def test_cli_comparison_is_opt_in(self):
         from unittest.mock import patch

@@ -94,10 +94,12 @@ std::vector<std::size_t> AnchorSelection::select(
     case LocalAnchorSelectionAlgorithm::OnlineQRColumnPivoting:
         return OnlineQRAnchorSelection::select(*this, points, weights, axes, tolerance,
                                                max_rank, mo_coeff, nocc, space, batch_size, debug);
-    case LocalAnchorSelectionAlgorithm::RandomizedQRColumnPivoting:
+    case LocalAnchorSelectionAlgorithm::RandomizedFeatureKhatriRao:
+    case LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao:
         return RandomizedIDAnchorSelection::select(*this, points, weights, axes, tolerance,
             max_rank, mo_coeff, nocc, space, batch_size, debug,
-            sketch_size, oversampling, seed, audit);
+            sketch_size, oversampling, seed, audit,
+            algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao);
     case LocalAnchorSelectionAlgorithm::CentroidalVoronoi:
         return CVTAnchorSelection::select(points, weights, cvt_weights, max_rank,
                                           space, seed, cvt_max_iter, cvt_tol, debug);
