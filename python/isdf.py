@@ -170,7 +170,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
-               metric_seed=0, pair_space_error=False):
+               metric_seed=0, pair_space_error=False, report_dimensions=False):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -316,6 +316,32 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         raise ValueError("RHF mean-field object has not converged")
     coefficients = np.ascontiguousarray(mf.mo_coeff) if needs_occ else None
     nocc = mol.nelectron // 2 if needs_occ else 0
+    nao = mol.nao_nr()
+    axis_width = sum(nocc if axis == mp_isdf.AxisType.OccupiedOrbital else nao
+                     for axis in axis_types)
+    pair_rank_ceiling = axis_width * (axis_width + 1) // 2
+    if report_dimensions:
+        dimensions = (
+            f"[ISDF dimensions] AOs={nao} axis_features={axis_width} "
+            f"symmetric_pair_rank_ceiling={pair_rank_ceiling} "
+            f"grid_points={len(all_coords)} nonzero_weight_points={int(np.count_nonzero(keep))}"
+        )
+        if anchor_algorithm in sketch_algorithms:
+            ell = (anchor_rank + anchor_oversampling
+                   if anchor_rank > 0 else anchor_sketch_size)
+            sketch_cap = min(ell - anchor_oversampling, pair_rank_ceiling,
+                             int(np.count_nonzero(keep)))
+            dimensions += (f" sketch_rows={ell} oversampling={anchor_oversampling}"
+                           f" sketch_rank_cap={sketch_cap}"
+                           f" sketch_matrix={ell}x{int(np.count_nonzero(keep))}"
+                           f" sketch_storage={ell * int(np.count_nonzero(keep)) * 8 / 2**20:.1f}MiB")
+            if anchor_rank > 0:
+                dimensions += f" requested_rank={anchor_rank}"
+                if anchor_rank > sketch_cap:
+                    dimensions += " requested_rank_exceeds_structural_cap=yes"
+            if anchor_rank > 0:
+                dimensions += " (anchor_sketch_size ignored)"
+        print(dimensions, flush=True)
     anchor_choices = {
         "dense": "QRColumnPivoting",
         "online": "OnlineQRColumnPivoting",
@@ -663,7 +689,8 @@ def main():
                         metric_seed=args.metric_seed,
                         derivative_targets=args.derivative_target,
                         pair_space_error=args.pair_space_error,
-                        report_timings=not args.debug, debug=args.debug)
+                        report_timings=not args.debug, debug=args.debug,
+                        report_dimensions=True)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
     if args.anchor_rank and len(result["anchor_indices"]) == args.anchor_rank:

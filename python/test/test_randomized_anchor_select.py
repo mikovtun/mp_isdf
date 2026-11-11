@@ -1,4 +1,6 @@
 """Small host/CUDA checks for the structured randomized pair-product sketch."""
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import sys
 import unittest
@@ -118,10 +120,15 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
                 self.weights = np.abs(self.weights)
                 return result
 
-        with patch.object(dft.gen_grid, "Grids", PositiveGrids):
+        output = io.StringIO()
+        with patch.object(dft.gen_grid, "Grids", PositiveGrids), redirect_stdout(output):
             result = build_isdf(mol, anchor_algorithm="rand_ao_kr_quadrature",
                                 anchor_rank=2, anchor_oversampling=3,
-                                compute_metric=False, selection_only=True, space="host")
+                                compute_metric=False, selection_only=True, space="host",
+                                report_dimensions=True)
+        self.assertIn("AOs=", output.getvalue())
+        self.assertIn("symmetric_pair_rank_ceiling=", output.getvalue())
+        self.assertIn("sketch_rows=5", output.getvalue())
         raw_grid = original_grids(mol)
         raw_grid.level = 0
         raw_grid.build()
