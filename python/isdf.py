@@ -2,8 +2,8 @@
 """Minimal grid ISDF demo adapted from ../isdf/isdf.py.
 
 PySCF builds the molecular grid; mp_isdf evaluates AOs and selects anchors
-with local QRCP (MAGMA on device, LAPACK++ on host). The ISDF fit remains
-in NumPy; the Coulomb metric uses integral-direct AO-pair Cholesky in C++.
+with local QRCP (MAGMA on device, LAPACK++ on host). The default ISDF fit remains in NumPy; rbrp-id instead reuses its RBRP ID.
+The Coulomb metric uses integral-direct AO-pair Cholesky in C++.
 Derivative targets are spatial electronic-coordinate AO derivatives (not
 nuclear gradients or assembled four-component spinor integrals).
 
@@ -22,6 +22,7 @@ from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
 import mp_isdf
+from rbrp_id import AOPairs, interpolate as rbrp_interpolate, select as rbrp_select
 
 
 AXES = {
@@ -184,6 +185,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                anchor_algorithm="dense", anchor_batch_size=128, fit_batch_size=2048,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
+               rbrp_block_size=16, rbrp_tau_block=None,
+               rbrp_rank_rtol=1e-12, rbrp_refresh_every=8,
+               rbrp_svd_rtol=1e-12,
                cvt_weight="electron_density", cvt_max_iter=100, cvt_tol=1e-5,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
@@ -201,7 +205,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
     `anchor_algorithm` is `dense` (default), `online` (direct multipass QRCP),
-    `rand_feature_kr` (Khatri-Rao sketch of concatenated features, signed
+    `rbrp` (host AO-only residual block sampling followed by the usual NumPy
+    fit), `rbrp-id` (same anchors with Algorithm 5.1 ID coefficients instead
+    of the NumPy scalar fit), `rand_feature_kr` (Khatri-Rao sketch of concatenated features, signed
     weights treated by absolute value), `rand_ao_kr_quadrature` (AO-only
     Khatri-Rao sketch weighted by absolute quadrature weights), or `cvt`.
     CVT requires a positive `anchor_rank`; it ignores
@@ -212,6 +218,11 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     clustering and snapping.
     `anchor_batch_size` controls selection streaming; `fit_batch_size` controls
     interpolation-vector batches without materializing grid-wide AO pairs.
+    RBRP uses sqrt(abs(grid_weight)) in its AO-pair rows, skips zero weights,
+    and interprets anchor_tol as a relative Frobenius norm tolerance (anchor_rank
+    is a cap). Only AO features and host selection are currently supported;
+    rbrp-id constructs both scalar interpolation vectors and metric coefficients
+    from the same SVD-stabilized small L1 factor, without the NumPy scalar fit.
     Rand sketch selection uses `anchor_tol` as sketch Frobenius
     tolerance and `anchor_seed`. With an explicit rank, sketch rows equal
     `anchor_rank + anchor_oversampling`; otherwise `anchor_sketch_size` sets
@@ -262,8 +273,21 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
     sketch_algorithms = ("rand_feature_kr", "rand_ao_kr_quadrature")
-    if anchor_algorithm not in ("dense", "online", "cvt", *sketch_algorithms):
-        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}; choose 'dense', 'online', 'rand_feature_kr', 'rand_ao_kr_quadrature' or 'cvt'")
+    rbrp_mode = anchor_algorithm in ("rbrp", "rbrp-id")
+    if anchor_algorithm not in ("dense", "online", "cvt", "rbrp", "rbrp-id", *sketch_algorithms):
+        raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}")
+    if rbrp_mode:
+        if axis_types != [mp_isdf.AxisType.AtomicOrbital]:
+            raise ValueError("RBRP currently requires axes=('ao',)")
+        if space == "device":
+            raise ValueError("RBRP currently runs on the host; use space='host' or 'auto'")
+        if (not isinstance(rbrp_block_size, (int, np.integer)) or rbrp_block_size < 1 or
+            not isinstance(rbrp_refresh_every, (int, np.integer)) or rbrp_refresh_every < 0 or
+            not np.isfinite(rbrp_rank_rtol) or rbrp_rank_rtol <= 0 or
+            not np.isfinite(rbrp_svd_rtol) or rbrp_svd_rtol < 0 or
+            (rbrp_tau_block is not None and
+             (not np.isfinite(rbrp_tau_block) or not 0 <= rbrp_tau_block < 1))):
+            raise ValueError("invalid RBRP block size, refresh interval or tolerances")
     if cvt_weight not in ("electron_density", "quadrature_weights"):
         raise ValueError("cvt_weight must be 'electron_density' or 'quadrature_weights'")
     if not isinstance(cvt_max_iter, (int, np.integer)) or cvt_max_iter < 1 or not np.isfinite(cvt_tol) or cvt_tol < 0:
@@ -278,6 +302,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         raise ValueError("anchor_rank and anchor_tol are mutually exclusive")
     if anchor_tol is None:
         anchor_tol = 1e-10
+    if not np.isfinite(anchor_tol) or anchor_tol < 0:
+        raise ValueError("anchor_tol must be finite and nonnegative")
     if (not isinstance(anchor_sketch_size, (int, np.integer)) or
         not isinstance(anchor_oversampling, (int, np.integer)) or
         anchor_oversampling < 1 or anchor_sketch_size < 1 or
@@ -367,11 +393,12 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         "rand_ao_kr_quadrature": "RandomizedAOQuadratureKhatriRao",
         "cvt": "CentroidalVoronoi",
     }
-    try:
-        anchor_choice = getattr(mp_isdf.LocalAnchorSelectionAlgorithm,
-                                anchor_choices[anchor_algorithm])
-    except AttributeError as exc:
-        raise RuntimeError("rebuild the mp_isdf extension to use this anchor algorithm") from exc
+    if not rbrp_mode:
+        try:
+            anchor_choice = getattr(mp_isdf.LocalAnchorSelectionAlgorithm,
+                                    anchor_choices[anchor_algorithm])
+        except AttributeError as exc:
+            raise RuntimeError("rebuild the mp_isdf extension to use this anchor algorithm") from exc
     cvt_weights = None
     if anchor_algorithm == "cvt":
         cvt_weights = np.zeros(len(all_coords), dtype=np.float64)
@@ -389,21 +416,41 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             cvt_weights[keep] = np.maximum(
                 dft.numint.eval_rho(mol, ao_cvt, rks.make_rdm1()), 0.0)
         record("cvt_weights")
-    anchor_indices = np.asarray(selector.select(
-        all_coords, all_weights, axis_types, tolerance=anchor_tol,
-        max_rank=anchor_rank, algorithm=anchor_choice,
-        mo_coeff=coefficients, nocc=nocc, space=space,
-        batch_size=anchor_batch_size, debug=debug,
-        sketch_size=anchor_sketch_size, oversampling=anchor_oversampling,
-        seed=anchor_seed, audit=anchor_audit,
-        cvt_weights=cvt_weights, cvt_max_iter=cvt_max_iter, cvt_tol=cvt_tol,
-    ), dtype=np.intp)
+    rbrp_result = None
+    rbrp_operator = None
+    rbrp_ao = None
+    if rbrp_mode:
+        # AO rows are evaluated once; the RBRP operator streams packed pair rows.
+        rbrp_ao = context.eval_ao(all_coords[keep], space="host")
+        rbrp_operator = AOPairs(rbrp_ao, all_weights[keep], anchor_batch_size)
+        rbrp_result = rbrp_select(
+            rbrp_operator, block_size=rbrp_block_size, rtol=anchor_tol,
+            max_rank=anchor_rank, seed=anchor_seed, tau_block=rbrp_tau_block,
+            rank_rtol=rbrp_rank_rtol, refresh_every=rbrp_refresh_every)
+        anchor_indices = np.flatnonzero(keep)[rbrp_result.indices]
+        if debug:
+            print(f"[rbrp] rank={len(anchor_indices)} residual={rbrp_result.relative_residual:.6e} "
+                  f"status={rbrp_result.status} blocks={len(rbrp_result.history)}", flush=True)
+    else:
+        anchor_indices = np.asarray(selector.select(
+            all_coords, all_weights, axis_types, tolerance=anchor_tol,
+            max_rank=anchor_rank, algorithm=anchor_choice,
+            mo_coeff=coefficients, nocc=nocc, space=space,
+            batch_size=anchor_batch_size, debug=debug,
+            sketch_size=anchor_sketch_size, oversampling=anchor_oversampling,
+            seed=anchor_seed, audit=anchor_audit,
+            cvt_weights=cvt_weights, cvt_max_iter=cvt_max_iter, cvt_tol=cvt_tol,
+        ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("anchor selection found no anchors; adjust settings or grid")
     record("anchor_selection")
     if selection_only:
         return {
             "anchor_indices": anchor_indices,
+            "rbrp_diagnostics": ({"relative_residual": rbrp_result.relative_residual,
+                                  "status": rbrp_result.status,
+                                  "history": rbrp_result.history}
+                                 if rbrp_mode else None),
             "anchor_coords": all_coords[anchor_indices],
             "anchor_weights": all_weights[anchor_indices],
             "coordinates": all_coords[keep],
@@ -423,25 +470,32 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     # Only nonzero-weight points contribute to the ISDF fit and Coulomb metric.
     coords = all_coords[keep]
     weights = all_weights[keep]
-    ao = context.eval_ao(coords, space=space)
+    ao = rbrp_ao if rbrp_mode else context.eval_ao(coords, space=space)
     anchor_coords = all_coords[anchor_indices]
     anchor_weights = all_weights[anchor_indices]
-    anchor_ao = context.eval_ao(anchor_coords, space=space)
+    anchor_ao = ao[rbrp_result.indices] if rbrp_mode else context.eval_ao(anchor_coords, space=space)
     record("ao_evaluation")
     rank, nao = anchor_ao.shape
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
-    weighted_pairs = anchor_pairs * anchor_weights[:, None]
-    gram = weighted_pairs @ weighted_pairs.T
-    gram_inverse = np.linalg.pinv(gram, rcond=1e-12)
-    transform = gram_inverse @ weighted_pairs
-    # P(grid) @ (W P(anchor)).T equals (AO(grid) @ AO(anchor).T)**2 * W.
-    # Unweighted interpolation vectors; quadrature weights enter only at integration.
-    interp_vecs = np.empty((rank, len(coords)), dtype=np.float64)
-    for first in range(0, len(coords), fit_batch_size):
-        stop = min(first + fit_batch_size, len(coords))
-        cross = (ao[first:stop] @ anchor_ao.T)**2
-        cross *= anchor_weights[None, :]
-        interp_vecs[:, first:stop] = gram_inverse @ cross.T
+    id_info = None
+    if anchor_algorithm == "rbrp-id":
+        # Algorithm 5.1: reuse L and Q; no NumPy AO-pair Gram fit.
+        interp_vecs, transform, id_info = rbrp_interpolate(
+            rbrp_operator, rbrp_result, svd_rtol=rbrp_svd_rtol)
+        if debug:
+            print(f"[rbrp-id] {id_info}", flush=True)
+    else:
+        weighted_pairs = anchor_pairs * anchor_weights[:, None]
+        gram = weighted_pairs @ weighted_pairs.T
+        gram_inverse = np.linalg.pinv(gram, rcond=1e-12)
+        transform = gram_inverse @ weighted_pairs
+        # P(grid) @ (W P(anchor)).T equals (AO(grid) @ AO(anchor).T)**2 * W.
+        interp_vecs = np.empty((rank, len(coords)), dtype=np.float64)
+        for first in range(0, len(coords), fit_batch_size):
+            stop = min(first + fit_batch_size, len(coords))
+            cross = (ao[first:stop] @ anchor_ao.T)**2
+            cross *= anchor_weights[None, :]
+            interp_vecs[:, first:stop] = gram_inverse @ cross.T
     record("isdf_fit")
     pair_space_errors = None
     if pair_space_error:
@@ -564,6 +618,11 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             record("derivative_integrals")
     return {
         "anchor_indices": anchor_indices,
+        "rbrp_diagnostics": ({"relative_residual": rbrp_result.relative_residual,
+                              "status": rbrp_result.status,
+                              "history": rbrp_result.history,
+                              "id": id_info}
+                             if rbrp_mode else None),
         "anchor_coords": anchor_coords,
         "anchor_weights": anchor_weights,
         "coordinates": coords,
@@ -614,8 +673,14 @@ def main():
     parser.add_argument("--anchor-tol", type=float, default=None,
                         help="stop at this relative QR/sketch residual tolerance (default: 1e-10 if rank omitted)")
     parser.add_argument("--anchor-algorithm",
-                        choices=("dense", "online", "rand_feature_kr", "rand_ao_kr_quadrature", "cvt"),
-                        default="dense", help="anchor selection: dense, online, rand_feature_kr, rand_ao_kr_quadrature, or cvt")
+                        choices=("dense", "online", "rand_feature_kr", "rand_ao_kr_quadrature", "cvt", "rbrp", "rbrp-id"),
+                        default="dense", help="rbrp selects anchors and uses the existing fit; rbrp-id uses Algorithm 5.1 ID coefficients")
+    parser.add_argument("--rbrp-block-size", type=int, default=16)
+    parser.add_argument("--rbrp-tau-block", type=float, default=None,
+                        help="local QR trailing-energy threshold (default: 1/block_size)")
+    parser.add_argument("--rbrp-rank-rtol", type=float, default=1e-12)
+    parser.add_argument("--rbrp-refresh-every", type=int, default=8)
+    parser.add_argument("--rbrp-svd-rtol", type=float, default=1e-12)
     parser.add_argument("--anchor-batch-size", type=int, default=128,
                         help="grid points per AO batch for online or rand sketch anchor selection")
     parser.add_argument("--fit-batch-size", type=int, default=2048,
@@ -715,6 +780,11 @@ def main():
                         anchor_sketch_size=args.anchor_sketch_size,
                         anchor_oversampling=args.anchor_oversampling,
                         anchor_seed=args.anchor_seed, anchor_audit=args.anchor_audit,
+                        rbrp_block_size=args.rbrp_block_size,
+                        rbrp_tau_block=args.rbrp_tau_block,
+                        rbrp_rank_rtol=args.rbrp_rank_rtol,
+                        rbrp_refresh_every=args.rbrp_refresh_every,
+                        rbrp_svd_rtol=args.rbrp_svd_rtol,
                         cvt_weight=args.cvt_weight, cvt_max_iter=args.cvt_max_iter,
                         cvt_tol=args.cvt_tol,
                         metric_algorithm=args.metric, metric_tol=args.metric_tol,
@@ -727,6 +797,12 @@ def main():
                         report_dimensions=True)
     print(f"Grid points: {len(result['coordinates'])}; AOs: {mol.nao_nr()}; "
           f"anchors: {len(result['anchor_indices'])}")
+    if result["rbrp_diagnostics"] is not None:
+        diagnostics = result["rbrp_diagnostics"]
+        print(f"RBRP projection residual: {diagnostics['relative_residual']:.3e}; "
+              f"status: {diagnostics['status']}")
+        if diagnostics.get("id") is not None:
+            print(f"RBRP ID retained SVD rank: {diagnostics['id']['retained_rank']}")
     if args.anchor_rank and len(result["anchor_indices"]) == args.anchor_rank:
         print(f"Anchor count equals --anchor-rank {args.anchor_rank}; use --anchor-rank 0 "
               "for tolerance-only selection or a larger value for a higher cap.")
