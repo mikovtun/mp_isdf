@@ -5,7 +5,7 @@
 namespace isdf {
 
 // Two policies share the factored Gaussian Khatri-Rao sketch and sketch QRCP:
-// general axis features with abs(weights), or AO-only positive quadrature weights.
+// general axis features or AO-only quadrature, both weighted by abs(weights).
 // Pivots only: the packed sketch QR and its upper triangular R are the
 // natural continuation point for future ID coefficients X = R11^{-1} R1:.
 class RandomizedIDAnchorSelection {

@@ -83,10 +83,10 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
                 self.assertEqual(strict, general)
                 self.assertEqual(len(strict), 3)
                 self.assertNotIn(2, strict)
-        with self.assertRaisesRegex(ValueError, "nonnegative"):
-            self.selector.select(self.points, self.weights, self.axis,
-                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
-                max_rank=3, space="host")
+        signed = self.selector.select(self.points, self.weights, self.axis,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
+            **opts)
+        self.assertEqual(strict, signed)
         with self.assertRaisesRegex(ValueError, "axes"):
             self.selector.select(self.points, positive,
                 [self.axis, mp_isdf.AxisType.AtomicOrbitalGradX],
@@ -110,7 +110,7 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
             build_isdf(mol, anchor_algorithm="rand_feature_kr", anchor_rank=2,
                        anchor_tol=1e-6, compute_metric=False, selection_only=True)
 
-    def test_driver_positive_quadrature(self):
+    def test_driver_absolute_quadrature_weights(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
         original_grids = dft.gen_grid.Grids
 
@@ -133,10 +133,11 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
         raw_grid.level = 0
         raw_grid.build()
         if np.any(raw_grid.weights < 0):
-            with self.assertRaisesRegex(ValueError, "nonnegative quadrature"):
-                build_isdf(mol, anchor_algorithm="rand_ao_kr_quadrature",
-                           anchor_rank=2, compute_metric=False, selection_only=True,
-                           space="host")
+            signed_result = build_isdf(mol, anchor_algorithm="rand_ao_kr_quadrature",
+                                       anchor_rank=2, anchor_oversampling=3,
+                                       compute_metric=False, selection_only=True,
+                                       space="host")
+            self.assertEqual(len(signed_result["anchor_indices"]), 2)
         feature = build_isdf(mol, anchor_algorithm="rand_feature_kr",
                              anchor_rank=2, anchor_oversampling=3,
                              compute_metric=False, selection_only=True, space="host")

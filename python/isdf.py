@@ -185,7 +185,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     `anchor_algorithm` is `dense` (default), `online` (direct multipass QRCP),
     `rand_feature_kr` (Khatri-Rao sketch of concatenated features, signed
     weights treated by absolute value), `rand_ao_kr_quadrature` (AO-only
-    Khatri-Rao sketch requiring nonnegative quadrature weights), or `cvt`.
+    Khatri-Rao sketch weighted by absolute quadrature weights), or `cvt`.
     CVT requires a positive `anchor_rank`; it ignores
     `anchor_tol` and `axes`, uses `anchor_seed`, `cvt_max_iter`, and `cvt_tol`,
     and uses either spin-summed RKS B3LYP electron density (default) or
@@ -300,9 +300,6 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     keep = all_weights != 0
     if not np.any(keep):
         raise ValueError("grid has no nonzero weights")
-    if anchor_algorithm == "rand_ao_kr_quadrature" and np.any(all_weights < 0):
-        raise ValueError("rand_ao_kr_quadrature requires nonnegative quadrature weights; "
-                         "use rand_feature_kr for a signed PySCF grid")
     record("grid")
 
     context = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)

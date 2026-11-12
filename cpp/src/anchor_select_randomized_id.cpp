@@ -120,13 +120,11 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     original.reserve(points.size());
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (!std::isfinite(weights[i])) throw std::invalid_argument("grid weights must be finite");
-        if (positive_ao_quadrature && weights[i] < 0)
-            throw std::invalid_argument("quadrature Khatri-Rao sketch requires nonnegative grid weights");
         if (weights[i] == 0) continue;
         for (double x : points[i])
             if (!std::isfinite(x)) throw std::invalid_argument("grid coordinates must be finite");
         kept_points.push_back(points[i]);
-        kept_weights.push_back(weights[i]);
+        kept_weights.push_back(positive_ao_quadrature ? std::abs(weights[i]) : weights[i]);
         original.push_back(i);
     }
     if (space == EvaluationSpace::Device) {
@@ -214,8 +212,7 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         auto hw = Kokkos::create_mirror_view(sw);
         // Positive AO mode uses sqrt(w); the feature mode retains sqrt(abs(w)).
         for (std::size_t g = 0; g < count; ++g)
-            hw(g) = std::sqrt(positive_ao_quadrature ? weights[start+g]
-                                                     : std::abs(weights[start+g]));
+            hw(g) = std::sqrt(std::abs(weights[start+g]));
         Kokkos::deep_copy(sw, hw);
         const double scaling = 1/std::sqrt(static_cast<double>(ell));
         using SketchPolicy = Kokkos::RangePolicy<Space, Kokkos::IndexType<std::size_t>>;
