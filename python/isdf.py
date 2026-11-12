@@ -161,9 +161,27 @@ def pair_space_error_norms(pair_grid, pair_anchor, anchor_weights, theta, grid_w
     return {"l2": absolute, "relative": relative}
 
 
+def _stream_pair_space_error_norms(left, right, pair_anchor, anchor_weights,
+                                   theta, grid_weights):
+    """Grid-weighted pair error with only one AO-pair matrix of scratch."""
+    anchor = (pair_anchor * anchor_weights[:, None]).reshape(
+        len(anchor_weights), left.shape[1], right.shape[1])
+    residual_sq = exact_sq = 0.0
+    for g in range(len(grid_weights)):
+        exact = np.outer(left[g], right[g])
+        reconstructed = np.einsum("k,kij->ij", theta[:, g], anchor,
+                                  optimize=True)
+        weight = abs(grid_weights[g])
+        residual_sq += weight * np.sum((exact - reconstructed)**2)
+        exact_sq += weight * np.sum(exact**2)
+    absolute = np.sqrt(residual_sq)
+    relative = absolute / np.sqrt(exact_sq) if exact_sq else (0.0 if absolute == 0 else np.inf)
+    return {"l2": absolute, "relative": relative}
+
+
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                axes=("ao",), compute_metric=True, space="auto",
-               anchor_algorithm="dense", anchor_batch_size=128,
+               anchor_algorithm="dense", anchor_batch_size=128, fit_batch_size=2048,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
                cvt_weight="electron_density", cvt_max_iter=100, cvt_tol=1e-5,
@@ -192,8 +210,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     absolute quadrature weights as its importance vector, not their product.
     Zero quadrature-weight and zero-importance sites are excluded from
     clustering and snapping.
-    `anchor_batch_size` controls
-    streaming; rand sketch selection uses `anchor_tol` as sketch Frobenius
+    `anchor_batch_size` controls selection streaming; `fit_batch_size` controls
+    interpolation-vector batches without materializing grid-wide AO pairs.
+    Rand sketch selection uses `anchor_tol` as sketch Frobenius
     tolerance and `anchor_seed`. With an explicit rank, sketch rows equal
     `anchor_rank + anchor_oversampling`; otherwise `anchor_sketch_size` sets
     the sketch rows (and `sketch_size - oversampling` caps the rank).
@@ -253,6 +272,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         raise ValueError("CVT requires a positive anchor_rank")
     if not isinstance(anchor_batch_size, (int, np.integer)) or anchor_batch_size <= 0:
         raise ValueError("anchor_batch_size must be a positive integer")
+    if not isinstance(fit_batch_size, (int, np.integer)) or fit_batch_size <= 0:
+        raise ValueError("fit_batch_size must be a positive integer")
     if anchor_rank != 0 and anchor_tol is not None:
         raise ValueError("anchor_rank and anchor_tol are mutually exclusive")
     if anchor_tol is None:
@@ -408,20 +429,25 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     anchor_ao = context.eval_ao(anchor_coords, space=space)
     record("ao_evaluation")
     rank, nao = anchor_ao.shape
-    products = (ao[:, :, None] * ao[:, None, :]).reshape(len(coords), nao * nao)
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
     weighted_pairs = anchor_pairs * anchor_weights[:, None]
     gram = weighted_pairs @ weighted_pairs.T
-    transform = np.linalg.pinv(gram, rcond=1e-12) @ weighted_pairs
-    # Unweighted interpolation vectors; quadrature weights are applied only
-    # where an integral is evaluated, not stored in the vectors themselves.
-    interp_vecs = (products @ transform.T).T
+    gram_inverse = np.linalg.pinv(gram, rcond=1e-12)
+    transform = gram_inverse @ weighted_pairs
+    # P(grid) @ (W P(anchor)).T equals (AO(grid) @ AO(anchor).T)**2 * W.
+    # Unweighted interpolation vectors; quadrature weights enter only at integration.
+    interp_vecs = np.empty((rank, len(coords)), dtype=np.float64)
+    for first in range(0, len(coords), fit_batch_size):
+        stop = min(first + fit_batch_size, len(coords))
+        cross = (ao[first:stop] @ anchor_ao.T)**2
+        cross *= anchor_weights[None, :]
+        interp_vecs[:, first:stop] = gram_inverse @ cross.T
     record("isdf_fit")
     pair_space_errors = None
     if pair_space_error:
         pair_space_errors = {
-            "scalar": pair_space_error_norms(products, anchor_pairs, anchor_weights,
-                                             interp_vecs, weights)
+            "scalar": _stream_pair_space_error_norms(
+                ao, ao, anchor_pairs, anchor_weights, interp_vecs, weights)
         }
         record("pair_space_check")
 
@@ -473,14 +499,21 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         def channel(label):
             if label not in channels:
                 left, right = label
-                pair_grid = (fields[left][:, :, None] *
-                             fields[right][:, None, :]).reshape(len(coords), nao*nao)
                 pair_anchor = (anchor_fields[left][:, :, None] *
                                anchor_fields[right][:, None, :]).reshape(rank, nao*nao)
                 # Fit each ordered channel independently, even with shared anchors.
+                # Keep the rectangular pseudoinverse's cutoff (not a squared Gram cutoff).
                 coefficients = np.linalg.pinv(pair_anchor * anchor_weights[:, None],
                                               rcond=1e-12).T
-                theta = (pair_grid @ coefficients.T).T
+                theta = np.empty((rank, len(coords)), dtype=np.float64)
+                coefficient_tensor = coefficients.reshape(rank, nao, nao)
+                for first in range(0, len(coords), fit_batch_size):
+                    stop = min(first + fit_batch_size, len(coords))
+                    contracted = np.einsum("gi,kij->gkj", fields[left][first:stop],
+                                           coefficient_tensor, optimize=True)
+                    theta[:, first:stop] = np.einsum(
+                        "gkj,gj->kg", contracted, fields[right][first:stop],
+                        optimize=True)
                 channels[label] = pair_anchor, coefficients, theta
             return channels[label]
 
@@ -490,10 +523,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             for label in labels:
                 pair_anchor, _, theta = channel(label)
                 left, right = label
-                pair_grid = (fields[left][:, :, None] *
-                             fields[right][:, None, :]).reshape(len(coords), nao*nao)
-                pair_space_errors[label] = pair_space_error_norms(
-                    pair_grid, pair_anchor, anchor_weights, theta, weights)
+                pair_space_errors[label] = _stream_pair_space_error_norms(
+                    fields[left], fields[right], pair_anchor, anchor_weights,
+                    theta, weights)
             record("derivative_pair_space_check")
 
         if compute_metric:
@@ -586,6 +618,8 @@ def main():
                         default="dense", help="anchor selection: dense, online, rand_feature_kr, rand_ao_kr_quadrature, or cvt")
     parser.add_argument("--anchor-batch-size", type=int, default=128,
                         help="grid points per AO batch for online or rand sketch anchor selection")
+    parser.add_argument("--fit-batch-size", type=int, default=2048,
+                        help="grid points per interpolation-vector fit batch")
     parser.add_argument("--anchor-sketch-size", type=int, default=128,
                         help="rand sketch rows when --anchor-rank=0 (default: 128)")
     parser.add_argument("--anchor-oversampling", type=int, default=16,
@@ -636,6 +670,8 @@ def main():
         parser.error("--cvt-max-iter must be positive and --cvt-tol finite and nonnegative")
     if args.anchor_batch_size <= 0:
         parser.error("--anchor-batch-size must be positive")
+    if args.fit_batch_size <= 0:
+        parser.error("--fit-batch-size must be positive")
     if args.anchor_sketch_size < 1 or args.anchor_oversampling < 1 or (
             args.anchor_algorithm in ("rand_feature_kr", "rand_ao_kr_quadrature") and args.anchor_rank == 0 and
             args.anchor_sketch_size <= args.anchor_oversampling):
@@ -675,6 +711,7 @@ def main():
                         compute_metric=not args.no_metric, space=args.space,
                         anchor_algorithm=args.anchor_algorithm,
                         anchor_batch_size=args.anchor_batch_size,
+                        fit_batch_size=args.fit_batch_size,
                         anchor_sketch_size=args.anchor_sketch_size,
                         anchor_oversampling=args.anchor_oversampling,
                         anchor_seed=args.anchor_seed, anchor_audit=args.anchor_audit,

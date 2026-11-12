@@ -68,6 +68,50 @@ class TestMinimalISDF(unittest.TestCase):
         np.testing.assert_allclose(sum(result["timings"].values()), result["elapsed"],
                                    rtol=1e-12, atol=1e-12)
 
+    def test_batched_fit_matches_dense_scalar_and_ordered_derivatives(self):
+        for batch_size in (1, 7, 100000):
+            with self.subTest(batch_size=batch_size):
+                result = build_isdf(self.mol, level=0, anchor_rank=2,
+                                    fit_batch_size=batch_size, compute_metric=False,
+                                    pair_space_error=True,
+                                    derivative_targets=("x00y", "x0y0"))
+                context = mp_isdf.LibcintContext(self.mol._atm, self.mol._bas,
+                                                  self.mol._env)
+                ao = context.eval_ao(result["coordinates"])
+                anchors = context.eval_ao(result["anchor_coords"])
+                pair_grid = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
+                pair_anchor = (anchors[:, :, None] * anchors[:, None, :]).reshape(
+                    len(anchors), -1)
+                weighted = pair_anchor * result["anchor_weights"][:, None]
+                reference = (pair_grid @ (np.linalg.pinv(
+                    weighted @ weighted.T, rcond=1e-12) @ weighted).T).T
+                np.testing.assert_allclose(result["interp_vecs"], reference,
+                                           rtol=1e-11, atol=1e-11)
+                gradients = context.eval_ao_gradient(result["coordinates"])
+                anchor_gradients = context.eval_ao_gradient(result["anchor_coords"])
+                fields = {"0": ao, **dict(zip("xyz", gradients))}
+                anchor_fields = {"0": anchors, **dict(zip("xyz", anchor_gradients))}
+                for label in ("x0", "0y", "y0"):
+                    left, right = label
+                    exact = (fields[left][:, :, None] *
+                             fields[right][:, None, :]).reshape(len(ao), -1)
+                    selected = (anchor_fields[left][:, :, None] *
+                                anchor_fields[right][:, None, :]).reshape(len(anchors), -1)
+                    theta = (exact @ np.linalg.pinv(
+                        selected * result["anchor_weights"][:, None],
+                        rcond=1e-12)).T
+                    error = pair_space_error_norms(exact, selected,
+                                                    result["anchor_weights"], theta,
+                                                    result["weights"])
+                    for key in ("l2", "relative"):
+                        np.testing.assert_allclose(result["pair_space_errors"][label][key],
+                                                   error[key], rtol=1e-10, atol=1e-12)
+
+    def test_fit_batch_size_validation(self):
+        for value in (0, -1, 1.5):
+            with self.assertRaisesRegex(ValueError, "fit_batch_size"):
+                build_isdf(self.mol, fit_batch_size=value)
+
     def test_pair_space_error_independent_of_metric(self):
         result = build_isdf(self.mol, level=0, anchor_rank=2,
                             compute_metric=False, pair_space_error=True,
