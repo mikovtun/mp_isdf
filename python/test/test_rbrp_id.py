@@ -37,6 +37,32 @@ class TestRBRPID(unittest.TestCase):
         self.assertAlmostEqual(err / np.sqrt(op.norm2().sum()), res.relative_residual, places=12)
         self.assertEqual(info["retained_rank"], len(j))
 
+    def test_cpp_backend_matches_direct_fit_at_its_pivots(self):
+        rng = np.random.default_rng(52)
+        ao = rng.normal(size=(36, 5))
+        weights = np.exp(rng.normal(size=36)) * rng.choice([-1., 1.], size=36)
+        opts = dict(block_size=4, batch_size=8, max_rank=8, seed=12,
+                    tolerance=0., compute_id=True)
+        result = mp_isdf.rbrp_ao_cpu(ao, weights, **opts)
+        j = np.asarray(result["indices"])
+        self.assertEqual(len(np.unique(j)), len(j))
+        np.testing.assert_array_equal(j, mp_isdf.rbrp_ao_cpu(ao, weights, **opts)["indices"])
+        pairs = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
+        direct = np.linalg.pinv(weights[j, None] * pairs[j], rcond=1e-12).T
+        np.testing.assert_allclose(result["transform"], direct, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(result["interp_vecs"], (pairs @ direct.T).T,
+                                   rtol=1e-10, atol=1e-10)
+        residual = (pairs - result["interp_vecs"].T @ (weights[j, None]*pairs[j]))
+        relative = (np.linalg.norm(residual * np.sqrt(np.abs(weights))[:, None]) /
+                    np.linalg.norm(pairs * np.sqrt(np.abs(weights))[:, None]))
+        self.assertAlmostEqual(relative, result["relative_residual"], places=10)
+        self.assertEqual(result["retained_rank"], len(j))
+        self.assertEqual(result["history"].shape[1], 4)
+        only = mp_isdf.rbrp_ao_cpu(ao, weights, **(opts | {"compute_id": False}))
+        self.assertNotIn("interp_vecs", only)
+        with self.assertRaisesRegex(ValueError, "nonzero weights"):
+            mp_isdf.rbrp_ao_cpu(ao, np.zeros(len(ao)))
+
     def test_rank_deficiency_zero_and_validation(self):
         rng = np.random.default_rng(11)
         ao = np.tile(rng.normal(size=(3, 3)), (8, 1))
@@ -90,12 +116,61 @@ class TestRBRPID(unittest.TestCase):
         self.assertAlmostEqual(result["pair_space_errors"]["scalar"]["relative"],
                                result["rbrp_diagnostics"]["relative_residual"], places=10)
 
-    def test_driver_rejects_unsupported_axes_and_device(self):
+    def test_driver_rejects_unsupported_axes(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
         with self.assertRaisesRegex(ValueError, "axes"):
             build_isdf(mol, anchor_algorithm="rbrp-id", axes=("dx",))
-        with self.assertRaisesRegex(ValueError, "host"):
+
+    @unittest.skipIf(hasattr(mp_isdf, "rbrp_ao_device"), "requires CPU-only build")
+    def test_device_rejected_without_cuda(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
+        with self.assertRaisesRegex(ValueError, "requires a CUDA build"):
             build_isdf(mol, anchor_algorithm="rbrp-id", space="device")
+
+    @unittest.skipUnless(hasattr(mp_isdf, "rbrp_ao_device"), "requires CUDA build")
+    def test_device_rbrp_id_and_signed_weights(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
+        grid = dft.gen_grid.Grids(mol)
+        grid.level = 0
+        grid.build()
+        mask = grid.weights != 0
+        coords = np.ascontiguousarray(grid.coords[mask])
+        weights = np.ascontiguousarray(grid.weights[mask])
+        weights[::2] *= -1
+        context = mp_isdf.LibcintContext(mol._atm, mol._bas, mol._env)
+        selector = mp_isdf.AnchorSelection(context)
+        ao = context.eval_ao(coords, space="host")
+        pairs = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
+        for block in (1, 2, 4):
+            device = mp_isdf.rbrp_ao_device(selector, coords, weights,
+                                            max_rank=2, block_size=block,
+                                            batch_size=37, compute_id=True)
+            j = device["indices"]
+            ref = np.linalg.pinv(weights[j, None]*pairs[j], rcond=1e-12).T
+            np.testing.assert_allclose(device["transform"], ref, rtol=1e-9, atol=1e-9)
+            np.testing.assert_allclose(device["interp_vecs"], (pairs @ ref.T).T,
+                                       rtol=1e-9, atol=1e-9)
+            exact = pairs - device["interp_vecs"].T @ (weights[j, None]*pairs[j])
+            rel = (np.linalg.norm(exact*np.sqrt(np.abs(weights))[:, None]) /
+                   np.linalg.norm(pairs*np.sqrt(np.abs(weights))[:, None]))
+            self.assertAlmostEqual(rel, device["relative_residual"], places=10)
+        dev_fit = build_isdf(mol, anchor_algorithm="rbrp-id", anchor_rank=2,
+                             space="device", pair_space_error=True,
+                             compute_metric=False)
+        self.assertAlmostEqual(dev_fit["pair_space_errors"]["scalar"]["relative"],
+                               dev_fit["rbrp_diagnostics"]["relative_residual"], places=10)
+        selected = build_isdf(mol, anchor_algorithm="rbrp", anchor_rank=2,
+                              space="device", compute_metric=False, selection_only=True)
+        self.assertEqual(len(selected["anchor_indices"]), 2)
+        with patch.object(mp_isdf, "rbrp_ao_device", wraps=mp_isdf.rbrp_ao_device) as gpu:
+            automatic = build_isdf(mol, anchor_algorithm="rbrp", anchor_rank=2,
+                                   space="auto", compute_metric=False, selection_only=True)
+            gpu.assert_called_once()
+            np.testing.assert_array_equal(automatic["anchor_indices"],
+                                          selected["anchor_indices"])
+            build_isdf(mol, anchor_algorithm="rbrp", anchor_rank=2,
+                       space="host", compute_metric=False, selection_only=True)
+            gpu.assert_called_once()
 
 
 if __name__ == "__main__":

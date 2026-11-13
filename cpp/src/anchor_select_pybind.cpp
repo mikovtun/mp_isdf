@@ -1,4 +1,6 @@
 #include "anchor_select.hpp"
+#include "anchor_select_rbrp.hpp"
+#include "anchor_select_rbrp_device.hpp"
 #include "evaluation_space_pybind.hpp"
 
 #include <Kokkos_Core.hpp>
@@ -9,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <stdexcept>
 #include <variant>
@@ -61,10 +64,81 @@ py::array_t<double> evaluate_axis_array(const isdf::AnchorSelection& selector,
         return result;
     }, selector.evaluate_axis(points, axes, coefficients, nocc, space));
 }
+
+py::dict rbrp_to_python(const isdf::RBRPResult& result, py::ssize_t n,
+                        py::ssize_t width, bool compute_id)
+{
+    const auto rank = static_cast<py::ssize_t>(result.indices.size());
+    py::dict output;
+    output["indices"] = py::cast(result.indices);
+    output["relative_residual"] = result.relative_residual;
+    output["status"] = result.status;
+    output["condition"] = result.condition;
+    output["retained_rank"] = result.retained_rank;
+    py::array_t<double> history({static_cast<py::ssize_t>(result.history.size()/4), py::ssize_t(4)});
+    std::copy(result.history.begin(), result.history.end(), history.mutable_data());
+    output["history"] = history;
+    if (compute_id) {
+        py::array_t<double> theta({rank, n});
+        std::copy(result.interp_vecs.begin(), result.interp_vecs.end(), theta.mutable_data());
+        py::array_t<double> transform({rank, width*width});
+        std::copy(result.transform.begin(), result.transform.end(), transform.mutable_data());
+        output["interp_vecs"] = theta;
+        output["transform"] = transform;
+    }
+    return output;
+}
 } // namespace
 
 void bind_anchor_select(py::module_& m)
 {
+    m.def("rbrp_ao_cpu", [](const FloatArray& ao, const FloatArray& weights,
+                             std::size_t batch_size, std::size_t block_size,
+                             double tolerance, std::size_t max_rank, std::uint64_t seed,
+                             py::object tau_block, double rank_rtol,
+                             std::size_t refresh_every, double svd_rtol, bool compute_id) {
+        if (ao.ndim() != 2 || weights.ndim() != 1 || weights.shape(0) != ao.shape(0))
+            throw std::invalid_argument("expected ao[grid,nao] and weights[grid]");
+        const auto tb = tau_block.is_none() ? std::numeric_limits<double>::quiet_NaN()
+                                             : tau_block.cast<double>();
+        auto result = isdf::rbrp_ao_cpu(ao.data(), weights.data(),
+            static_cast<std::size_t>(ao.shape(0)), static_cast<std::size_t>(ao.shape(1)),
+            batch_size, block_size, tolerance, max_rank, seed,
+            tb, rank_rtol, refresh_every, svd_rtol, compute_id);
+        return rbrp_to_python(result, ao.shape(0), ao.shape(1), compute_id);
+    }, py::arg("ao"), py::arg("weights"), py::arg("batch_size") = 128,
+       py::arg("block_size") = 16, py::arg("tolerance") = 1e-10,
+       py::arg("max_rank") = 0, py::arg("seed") = 7,
+       py::arg("tau_block") = py::none(), py::arg("rank_rtol") = 1e-12,
+       py::arg("refresh_every") = 8, py::arg("svd_rtol") = 1e-12,
+       py::arg("compute_id") = false,
+       "Host AO-only RBRP on nonzero grid rows; optional Algorithm 5.1 ID.");
+#ifdef KOKKOS_ENABLE_CUDA
+    m.def("rbrp_ao_device", [](const isdf::AnchorSelection& selector,
+        const FloatArray& points, const FloatArray& weights,
+        std::size_t batch_size, std::size_t block_size, double tolerance,
+        std::size_t max_rank, std::uint64_t seed, py::object tau_block,
+        double rank_rtol, std::size_t refresh_every, double svd_rtol,
+        bool compute_id) {
+        if (weights.ndim()!=1 || weights.shape(0)!=points.shape(0))
+            throw std::invalid_argument("expected weights[ngrid]");
+        auto grid=read_points(points);
+        const auto tb=tau_block.is_none() ? std::numeric_limits<double>::quiet_NaN()
+                                         : tau_block.cast<double>();
+        auto result=isdf::rbrp_ao_device(selector,grid,
+            std::vector<double>(weights.data(),weights.data()+weights.size()),
+            batch_size,block_size,tolerance,max_rank,seed,tb,
+            rank_rtol,refresh_every,svd_rtol,compute_id);
+        return rbrp_to_python(result,points.shape(0),
+            static_cast<py::ssize_t>(selector.nao()),compute_id);
+    }, py::arg("selector"), py::arg("points"), py::arg("weights"),
+       py::arg("batch_size")=128, py::arg("block_size")=16,
+       py::arg("tolerance")=1e-10, py::arg("max_rank")=0,
+       py::arg("seed")=7, py::arg("tau_block")=py::none(),
+       py::arg("rank_rtol")=1e-12, py::arg("refresh_every")=8,
+       py::arg("svd_rtol")=1e-12, py::arg("compute_id")=false,
+       "CUDA AO-only RBRP; evaluates AOs in device batches and returns optional ID.");
+#endif
     py::enum_<AxisType>(m, "AxisType")
         .value("AtomicOrbital", AxisType::AtomicOrbital)
         .value("AtomicOrbitalGradX", AxisType::AtomicOrbitalGradX)

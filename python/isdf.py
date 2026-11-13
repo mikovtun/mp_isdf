@@ -22,7 +22,6 @@ from pyscf import dft, gto, scf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
 import mp_isdf
-from rbrp_id import AOPairs, interpolate as rbrp_interpolate, select as rbrp_select
 
 
 AXES = {
@@ -220,9 +219,12 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     interpolation-vector batches without materializing grid-wide AO pairs.
     RBRP uses sqrt(abs(grid_weight)) in its AO-pair rows, skips zero weights,
     and interprets anchor_tol as a relative Frobenius norm tolerance (anchor_rank
-    is a cap). Only AO features and host selection are currently supported;
-    rbrp-id constructs both scalar interpolation vectors and metric coefficients
-    from the same SVD-stabilized small L1 factor, without the NumPy scalar fit.
+    is a cap). Only AO features are currently supported. space='device' uses
+    bounded Kokkos CUDA AO evaluation and MAGMA QR/BLAS in a CUDA build;
+    space='auto' uses the device backend in a CUDA build and host otherwise.
+    rbrp-id constructs both
+    scalar interpolation vectors and metric coefficients from the same
+    SVD-stabilized small L1 factor, without the NumPy scalar fit.
     Rand sketch selection uses `anchor_tol` as sketch Frobenius
     tolerance and `anchor_seed`. With an explicit rank, sketch rows equal
     `anchor_rank + anchor_oversampling`; otherwise `anchor_sketch_size` sets
@@ -279,8 +281,6 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     if rbrp_mode:
         if axis_types != [mp_isdf.AxisType.AtomicOrbital]:
             raise ValueError("RBRP currently requires axes=('ao',)")
-        if space == "device":
-            raise ValueError("RBRP currently runs on the host; use space='host' or 'auto'")
         if (not isinstance(rbrp_block_size, (int, np.integer)) or rbrp_block_size < 1 or
             not isinstance(rbrp_refresh_every, (int, np.integer)) or rbrp_refresh_every < 0 or
             not np.isfinite(rbrp_rank_rtol) or rbrp_rank_rtol <= 0 or
@@ -417,20 +417,31 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                 dft.numint.eval_rho(mol, ao_cvt, rks.make_rdm1()), 0.0)
         record("cvt_weights")
     rbrp_result = None
-    rbrp_operator = None
     rbrp_ao = None
     if rbrp_mode:
-        # AO rows are evaluated once; the RBRP operator streams packed pair rows.
-        rbrp_ao = context.eval_ao(all_coords[keep], space="host")
-        rbrp_operator = AOPairs(rbrp_ao, all_weights[keep], anchor_batch_size)
-        rbrp_result = rbrp_select(
-            rbrp_operator, block_size=rbrp_block_size, rtol=anchor_tol,
-            max_rank=anchor_rank, seed=anchor_seed, tau_block=rbrp_tau_block,
-            rank_rtol=rbrp_rank_rtol, refresh_every=rbrp_refresh_every)
-        anchor_indices = np.flatnonzero(keep)[rbrp_result.indices]
+        settings = dict(batch_size=anchor_batch_size, block_size=rbrp_block_size,
+                        tolerance=anchor_tol, max_rank=anchor_rank, seed=anchor_seed,
+                        tau_block=rbrp_tau_block, rank_rtol=rbrp_rank_rtol,
+                        refresh_every=rbrp_refresh_every, svd_rtol=rbrp_svd_rtol,
+                        compute_id=(anchor_algorithm == "rbrp-id" and not selection_only))
+        device_backend = getattr(mp_isdf, "rbrp_ao_device", None)
+        if space == "device" and device_backend is None:
+            raise ValueError("RBRP device selection requires a CUDA build")
+        if space == "device" or (space == "auto" and device_backend is not None):
+            rbrp_result = device_backend(selector, all_coords[keep], all_weights[keep],
+                                         **settings)
+        else:
+            # Host backend reuses the AO array subsequently needed by the driver.
+            rbrp_ao = context.eval_ao(all_coords[keep], space="host")
+            try:
+                rbrp_backend = mp_isdf.rbrp_ao_cpu
+            except AttributeError as exc:
+                raise RuntimeError("rebuild the mp_isdf extension for the C++ RBRP backend") from exc
+            rbrp_result = rbrp_backend(rbrp_ao, all_weights[keep], **settings)
+        anchor_indices = np.flatnonzero(keep)[rbrp_result["indices"]]
         if debug:
-            print(f"[rbrp] rank={len(anchor_indices)} residual={rbrp_result.relative_residual:.6e} "
-                  f"status={rbrp_result.status} blocks={len(rbrp_result.history)}", flush=True)
+            print(f"[rbrp] rank={len(anchor_indices)} residual={rbrp_result['relative_residual']:.6e} "
+                  f"status={rbrp_result['status']} blocks={len(rbrp_result['history'])}", flush=True)
     else:
         anchor_indices = np.asarray(selector.select(
             all_coords, all_weights, axis_types, tolerance=anchor_tol,
@@ -447,9 +458,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     if selection_only:
         return {
             "anchor_indices": anchor_indices,
-            "rbrp_diagnostics": ({"relative_residual": rbrp_result.relative_residual,
-                                  "status": rbrp_result.status,
-                                  "history": rbrp_result.history}
+            "rbrp_diagnostics": ({key: rbrp_result[key] for key in
+                                  ("relative_residual", "status", "history")}
                                  if rbrp_mode else None),
             "anchor_coords": all_coords[anchor_indices],
             "anchor_weights": all_weights[anchor_indices],
@@ -470,18 +480,20 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     # Only nonzero-weight points contribute to the ISDF fit and Coulomb metric.
     coords = all_coords[keep]
     weights = all_weights[keep]
-    ao = rbrp_ao if rbrp_mode else context.eval_ao(coords, space=space)
+    ao = rbrp_ao if rbrp_ao is not None else context.eval_ao(coords, space=space)
     anchor_coords = all_coords[anchor_indices]
     anchor_weights = all_weights[anchor_indices]
-    anchor_ao = ao[rbrp_result.indices] if rbrp_mode else context.eval_ao(anchor_coords, space=space)
+    anchor_ao = ao[rbrp_result["indices"]] if rbrp_mode else context.eval_ao(anchor_coords, space=space)
     record("ao_evaluation")
     rank, nao = anchor_ao.shape
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
     id_info = None
     if anchor_algorithm == "rbrp-id":
         # Algorithm 5.1: reuse L and Q; no NumPy AO-pair Gram fit.
-        interp_vecs, transform, id_info = rbrp_interpolate(
-            rbrp_operator, rbrp_result, svd_rtol=rbrp_svd_rtol)
+        interp_vecs = rbrp_result["interp_vecs"]
+        transform = rbrp_result["transform"]
+        id_info = {key: rbrp_result[key] for key in
+                   ("retained_rank", "condition", "relative_residual", "status")}
         if debug:
             print(f"[rbrp-id] {id_info}", flush=True)
     else:
@@ -618,9 +630,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             record("derivative_integrals")
     return {
         "anchor_indices": anchor_indices,
-        "rbrp_diagnostics": ({"relative_residual": rbrp_result.relative_residual,
-                              "status": rbrp_result.status,
-                              "history": rbrp_result.history,
+        "rbrp_diagnostics": ({"relative_residual": rbrp_result["relative_residual"],
+                              "status": rbrp_result["status"],
+                              "history": rbrp_result["history"],
                               "id": id_info}
                              if rbrp_mode else None),
         "anchor_coords": anchor_coords,
