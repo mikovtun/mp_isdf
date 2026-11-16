@@ -14,7 +14,8 @@ public:
         const std::vector<AxisType>& axes,
         double tolerance, std::size_t max_rank,
         const std::vector<double>& mo_coeff, std::size_t nocc,
-        EvaluationSpace space, std::size_t batch_size, bool debug);
+        EvaluationSpace space, std::size_t batch_size, bool debug,
+        const std::vector<double>& axis_scales);
 
     // CUDA extended lambdas require a public enclosing function.
     template <class ExecutionSpace>
@@ -26,7 +27,8 @@ public:
         const std::vector<AxisType>& axes,
         double tolerance, std::size_t max_rank,
         const std::vector<double>& mo_coeff, std::size_t nocc,
-        std::size_t batch_size, bool debug);
+        std::size_t batch_size, bool debug,
+        const std::vector<double>& axis_scales);
 };
 
 } // namespace isdf

@@ -6,6 +6,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -85,21 +86,72 @@ std::vector<std::size_t> AnchorSelection::select(
     const std::vector<double>& mo_coeff,
     std::size_t nocc, EvaluationSpace space, std::size_t batch_size, bool debug,
     std::size_t sketch_size, std::size_t oversampling, std::uint64_t seed, bool audit,
-    const std::vector<double>& cvt_weights, std::size_t cvt_max_iter, double cvt_tol) const
+    const std::vector<double>& cvt_weights, std::size_t cvt_max_iter, double cvt_tol,
+    const std::vector<double>& axis_weights) const
 {
+    if (!axis_weights.empty() && axis_weights.size() != axes.size())
+        throw std::invalid_argument("axis weights must match axes");
+    for (double weight : axis_weights)
+        if (!std::isfinite(weight) || weight <= 0)
+            throw std::invalid_argument("axis weights must be finite and positive");
+    std::vector<double> scales;
+    if (axes.size() > 1 && algorithm != LocalAnchorSelectionAlgorithm::CentroidalVoronoi) {
+        if (points.size() != weights.size())
+            throw std::invalid_argument("points and weights must have equal lengths");
+        const auto spec = axis_spec(axes, mo_coeff, nocc);
+        std::vector<double> norms(axes.size(), 0.0);
+        // Global (not per-batch) Frobenius norms over eligible grid points.
+        // A bounded host pass also keeps online QR's streaming memory bound.
+        std::vector<std::array<double, 3>> batch;
+        batch.reserve(128);
+        bool any_eligible = false;
+        auto accumulate = [&]() {
+            if (batch.empty()) return;
+            const auto evaluated = evaluate_axis<Kokkos::DefaultHostExecutionSpace>(
+                batch, axes, mo_coeff, nocc);
+            auto values = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, evaluated.values);
+            for (std::size_t g = 0; g < batch.size(); ++g) {
+                std::size_t offset = 0;
+                for (std::size_t a = 0; a < axes.size(); ++a) {
+                    const std::size_t width = axes[a] == AxisType::OccupiedOrbital ? nocc : nao();
+                    for (std::size_t j = 0; j < width; ++j)
+                        norms[a] = std::hypot(norms[a], values(g*spec.width + offset + j));
+                    offset += width;
+                }
+            }
+            batch.clear();
+        };
+        for (std::size_t g = 0; g < points.size(); ++g) {
+            if (!std::isfinite(weights[g])) throw std::invalid_argument("grid weights must be finite");
+            if (weights[g] == 0) continue;
+            any_eligible = true;
+            batch.push_back(points[g]);
+            if (batch.size() == 128) accumulate();
+        }
+        accumulate();
+        scales.reserve(axes.size());
+        for (std::size_t a = 0; any_eligible && a < axes.size(); ++a) {
+            if (!(norms[a] > 0) || !std::isfinite(norms[a]))
+                throw std::invalid_argument("axis Frobenius norm must be finite and positive");
+            const double scale = (axis_weights.empty() ? 1.0 : axis_weights[a]) / norms[a];
+            if (!(scale > 0) || !std::isfinite(scale))
+                throw std::invalid_argument("normalized axis scale must be finite and positive");
+            scales.push_back(scale);
+        }
+    }
     switch (algorithm) {
     case LocalAnchorSelectionAlgorithm::QRColumnPivoting:
         return QRCPAnchorSelection::select(*this, points, weights, axes, tolerance,
-                                           max_rank, mo_coeff, nocc, space);
+                                           max_rank, mo_coeff, nocc, space, scales);
     case LocalAnchorSelectionAlgorithm::OnlineQRColumnPivoting:
         return OnlineQRAnchorSelection::select(*this, points, weights, axes, tolerance,
-                                               max_rank, mo_coeff, nocc, space, batch_size, debug);
+                                               max_rank, mo_coeff, nocc, space, batch_size, debug, scales);
     case LocalAnchorSelectionAlgorithm::RandomizedFeatureKhatriRao:
     case LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao:
         return RandomizedIDAnchorSelection::select(*this, points, weights, axes, tolerance,
             max_rank, mo_coeff, nocc, space, batch_size, debug,
             sketch_size, oversampling, seed, audit,
-            algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao);
+            algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao, scales);
     case LocalAnchorSelectionAlgorithm::CentroidalVoronoi:
         return CVTAnchorSelection::select(points, weights, cvt_weights, max_rank,
                                           space, seed, cvt_max_iter, cvt_tol, debug);

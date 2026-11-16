@@ -23,11 +23,12 @@ void audit_projection(const AnchorSelection& selector,
                       const std::vector<double>& weights,
                       const std::vector<AxisType>& axes,
                       const std::vector<double>& coeff, std::size_t nocc,
-                      const std::vector<std::size_t>& selected)
+                      const std::vector<std::size_t>& selected,
+                      const std::vector<double>& axis_scales)
 {
     const std::size_t n = points.size();
     const auto axis = selector.evaluate_axis<Kokkos::DefaultHostExecutionSpace>(
-        points, axes, coeff, nocc);
+        points, axes, coeff, nocc, axis_scales);
     const auto features = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, axis.values);
     const std::size_t d = axis.width, m = d*(d+1)/2;
     std::vector<double> matrix(m*n);
@@ -92,7 +93,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     const std::vector<double>& mo_coeff, std::size_t nocc,
     EvaluationSpace space, std::size_t batch_size, bool debug,
     std::size_t sketch_size, std::size_t oversampling,
-    std::uint64_t seed, bool audit, bool positive_ao_quadrature)
+    std::uint64_t seed, bool audit, bool positive_ao_quadrature,
+    const std::vector<double>& axis_scales)
 {
     if (positive_ao_quadrature &&
         (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
@@ -164,17 +166,17 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
             kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
             batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-            positive_ao_quadrature);
+            positive_ao_quadrature, axis_scales);
 #ifdef ISDF_ENABLE_CUDA
     return select_in_space<Kokkos::Cuda>(selector, kept_points, kept_weights,
         original, axes, tolerance, max_rank, mo_coeff, nocc,
         batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-        positive_ao_quadrature);
+        positive_ao_quadrature, axis_scales);
 #else
     return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
         kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
         batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-        positive_ao_quadrature);
+        positive_ao_quadrature, axis_scales);
 #endif
 }
 
@@ -186,7 +188,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
     const std::vector<AxisType>& axes, double tolerance, std::size_t max_rank,
     const std::vector<double>& mo_coeff, std::size_t nocc,
     std::size_t batch_size, bool debug, std::size_t ell, std::size_t oversampling,
-    std::uint64_t seed, bool audit, bool positive_ao_quadrature)
+    std::uint64_t seed, bool audit, bool positive_ao_quadrature,
+    const std::vector<double>& axis_scales)
 {
     const auto started = std::chrono::steady_clock::now();
     const std::size_t d = selector.axis_spec(axes, mo_coeff, nocc).width;
@@ -206,7 +209,7 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
     for (std::size_t start = 0; start < n; start += std::min(batch_size,n-start)) {
         const auto count = std::min(batch_size,n-start);
         std::vector<std::array<double,3>> batch(points.begin()+start, points.begin()+start+count);
-        auto axis = selector.evaluate_axis<Space>(batch, axes, mo_coeff, nocc);
+        auto axis = selector.evaluate_axis<Space>(batch, axes, mo_coeff, nocc, axis_scales);
         auto phi = axis.values;
         Kokkos::View<double*, Space> sw("id_weights", count);
         auto hw = Kokkos::create_mirror_view(sw);
@@ -311,7 +314,7 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         for (auto id : selected)
             local.push_back(static_cast<std::size_t>(
                 std::lower_bound(original.begin(), original.end(), id)-original.begin()));
-        audit_projection(selector, points, weights, axes, mo_coeff, nocc, local);
+        audit_projection(selector, points, weights, axes, mo_coeff, nocc, local, axis_scales);
     }
     // Future full-ID continuation: retain y's packed QR, jpvt, and QR tau in a
     // result object, then solve R11 * X = R[:rank,:] in grid batches. No A^T A.

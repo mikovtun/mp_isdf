@@ -99,7 +99,7 @@ std::vector<std::size_t> QRCPAnchorSelection::select(
     const std::vector<AxisType>& axes,
     double tolerance, std::size_t max_rank,
     const std::vector<double>& mo_coeff, std::size_t nocc,
-    EvaluationSpace space)
+    EvaluationSpace space, const std::vector<double>& axis_scales)
 {
     if (points.size() != weights.size() ||
         !std::isfinite(tolerance) || tolerance < 0) {
@@ -135,15 +135,15 @@ std::vector<std::size_t> QRCPAnchorSelection::select(
     switch (space) {
     case EvaluationSpace::Host:
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(
-            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc);
+            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc, axis_scales);
     case EvaluationSpace::Auto:
 #ifdef ISDF_ENABLE_CUDA
     case EvaluationSpace::Device:
         return select_in_space<Kokkos::Cuda>(
-            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc);
+            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc, axis_scales);
 #else
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(
-            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc);
+            selector, kept_points, kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc, axis_scales);
     case EvaluationSpace::Device:
         throw std::invalid_argument("device evaluation requires a CUDA build");
 #endif
@@ -159,9 +159,10 @@ std::vector<std::size_t> QRCPAnchorSelection::select_in_space(
     const std::vector<std::size_t>& original,
     const std::vector<AxisType>& axes,
     double tolerance, std::size_t max_rank,
-    const std::vector<double>& mo_coeff, std::size_t nocc)
+    const std::vector<double>& mo_coeff, std::size_t nocc,
+    const std::vector<double>& axis_scales)
 {
-    const auto axis = selector.evaluate_axis<Device>(kept_points, axes, mo_coeff, nocc);
+    const auto axis = selector.evaluate_axis<Device>(kept_points, axes, mo_coeff, nocc, axis_scales);
     const std::size_t nfeatures = axis.width;
     const auto& features = axis.values;
     const std::size_t ng = kept_points.size();

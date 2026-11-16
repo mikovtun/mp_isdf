@@ -401,6 +401,12 @@ class TestMinimalISDF(unittest.TestCase):
         self.assertLessEqual(len(result["anchor_indices"]), 2)
         self.assertIsNone(result["coulomb_metric"])
         self.assertTrue(np.isfinite(result["overlap_relative_error"]))
+        weighted = build_isdf(self.mol, mf, level=0, anchor_rank=2,
+                              axes=("ao", "occ"), axis_weights=(1., 2.),
+                              compute_metric=False, selection_only=True)
+        self.assertEqual(len(weighted["anchor_indices"]), 2)
+        with self.assertRaisesRegex(ValueError, "axis_weights"):
+            build_isdf(self.mol, mf, axes=("ao", "occ"), axis_weights=(1., 0.))
 
 
 if __name__ == "__main__":

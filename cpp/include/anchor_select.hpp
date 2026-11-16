@@ -26,8 +26,9 @@ using AnchorDeviceSpace = Kokkos::DefaultHostExecutionSpace;
 // Local grid-point selection by column-pivoted QR of the transpose of the
 // weighted pair-product matrix. Returned indices refer to the ORIGINAL grid,
 // in pivot order. Zero-weight points are excluded; negative weights enter as
-// sqrt(abs(weight)). An axis list concatenates its evaluated functions before
-// taking the per-point outer product with itself.
+// sqrt(abs(weight)). For multiple axes, each block is normalized by its
+// Frobenius norm over nonzero-weight grid sites and multiplied by its optional
+// relative axis weight before taking the per-point outer product.
 class AnchorSelection {
 public:
     explicit AnchorSelection(const LibcintContext& context) : context_(context) {}
@@ -49,7 +50,8 @@ public:
         const std::vector<std::array<double, 3>>& points,
         const std::vector<AxisType>& axes,
         const std::vector<double>& mo_coeff = {},
-        std::size_t nocc = 0) const;
+        std::size_t nocc = 0,
+        const std::vector<double>& axis_scales = {}) const;
 
     using RuntimeAxisEvaluation = std::variant<
         AxisEvaluation<Kokkos::DefaultHostExecutionSpace>,
@@ -62,6 +64,8 @@ public:
 
     // mo_coeff is a row-major (nao, nao) RHF matrix; nocc selects its first
     // nocc columns. Supply both if OccupiedOrbital is requested. Unused otherwise.
+    // axis_weights, if given, has one finite positive factor per axis occurrence;
+    // multiple axes are normalized globally before selection (single axis unchanged).
     // tolerance is relative to abs(R[0,0]); max_rank=0 means no explicit cap.
     std::vector<std::size_t> select(
         const std::vector<std::array<double, 3>>& points,
@@ -77,7 +81,8 @@ public:
         std::size_t sketch_size = 128, std::size_t oversampling = 16,
         std::uint64_t seed = 7, bool audit = false,
         const std::vector<double>& cvt_weights = {},
-        std::size_t cvt_max_iter = 100, double cvt_tol = 1e-5) const;
+        std::size_t cvt_max_iter = 100, double cvt_tol = 1e-5,
+        const std::vector<double>& axis_weights = {}) const;
 
 private:
     friend class QRCPAnchorSelection;

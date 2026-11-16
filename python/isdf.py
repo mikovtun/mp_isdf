@@ -180,7 +180,7 @@ def _stream_pair_space_error_norms(left, right, pair_anchor, anchor_weights,
 
 
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
-               axes=("ao",), compute_metric=True, space="auto",
+               axes=("ao",), axis_weights=None, compute_metric=True, space="auto",
                anchor_algorithm="dense", anchor_batch_size=128, fit_batch_size=2048,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
@@ -195,7 +195,10 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
-    before forming their outer product. The fitted tensor remains AO-pair ISDF.
+    before forming their outer product. With multiple axes, each block is
+    divided by its Frobenius norm over nonzero-weight grid sites, then
+    multiplied by its corresponding `axis_weights` factor (default 1).
+    The fitted tensor remains AO-pair ISDF.
     A positive `anchor_rank` forces that many pivots for rand sketch selection;
     it cannot be combined with an explicit `anchor_tol`. With neither set,
     the default tolerance is 1e-10. `anchor_tol` is a relative
@@ -274,6 +277,11 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         axis_types = [AXES[axis] if isinstance(axis, str) else axis for axis in axes]
     except KeyError as exc:
         raise ValueError(f"unknown axis: {exc.args[0]!r}; choose from {list(AXES)}") from exc
+    if axis_weights is not None:
+        axis_weights = tuple(float(w) for w in axis_weights)
+        if len(axis_weights) != len(axis_types) or not all(
+                np.isfinite(w) and w > 0 for w in axis_weights):
+            raise ValueError("axis_weights must contain one finite positive factor per axis")
     sketch_algorithms = ("rand_feature_kr", "rand_ao_kr_quadrature")
     rbrp_mode = anchor_algorithm in ("rbrp", "rbrp-id")
     if anchor_algorithm not in ("dense", "online", "cvt", "rbrp", "rbrp-id", *sketch_algorithms):
@@ -451,6 +459,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             sketch_size=anchor_sketch_size, oversampling=anchor_oversampling,
             seed=anchor_seed, audit=anchor_audit,
             cvt_weights=cvt_weights, cvt_max_iter=cvt_max_iter, cvt_tol=cvt_tol,
+            axis_weights=axis_weights if axis_weights is not None else [],
         ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("anchor selection found no anchors; adjust settings or grid")
@@ -712,7 +721,7 @@ def main():
     parser.add_argument("--anchor-audit", action="store_true",
                         help="compare rand sketch pivots to dense QRCP at equal rank (small grids only)")
     parser.add_argument("--axes", default="ao",
-                        help="comma-separated anchor-search features: ao,dx,dy,dz,occ")
+                        help="comma-separated anchor-search features with optional relative factors, e.g. ao:1,occ:2")
     parser.add_argument("--space", choices=("auto", "host", "device"), default="auto",
                         help="where AO evaluation and anchor selection run")
     parser.add_argument("--metric", choices=("unblocked_greedy", "unblocked_uniform", "grid"),
@@ -777,7 +786,20 @@ def main():
     comparison_timings = []
     atom = _read_xyz(args.molecule) if args.molecule else "H 0 0 0; H 0 0 0.74"
     mol = gto.M(atom=atom, basis=args.basis, unit="Angstrom", verbose=0)
-    axes = [axis.strip().lower() for axis in args.axes.split(",")]
+    axes = []
+    axis_weights = []
+    for entry in args.axes.split(","):
+        fields = entry.strip().lower().split(":")
+        if len(fields) > 2 or fields[0] not in AXES:
+            parser.error(f"invalid --axes entry: {entry!r}")
+        try:
+            factor = float(fields[1]) if len(fields) == 2 else 1.0
+        except ValueError:
+            parser.error(f"invalid --axes factor: {entry!r}")
+        if not np.isfinite(factor) or factor <= 0:
+            parser.error(f"--axes factor must be finite and positive: {entry!r}")
+        axes.append(fields[0])
+        axis_weights.append(factor)
     mf = None
     if "occ" in axes:
         mf = scf.RHF(mol).run(verbose=0)
@@ -785,7 +807,7 @@ def main():
             raise RuntimeError("RHF did not converge")
     result = build_isdf(mol, mf, level=args.level, anchor_rank=args.anchor_rank,
                         anchor_tol=args.anchor_tol, axes=axes,
-                        compute_metric=not args.no_metric, space=args.space,
+                        axis_weights=axis_weights, compute_metric=not args.no_metric, space=args.space,
                         anchor_algorithm=args.anchor_algorithm,
                         anchor_batch_size=args.anchor_batch_size,
                         fit_batch_size=args.fit_batch_size,

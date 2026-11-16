@@ -166,7 +166,8 @@ void bind_anchor_select(py::module_& m)
                           const std::string& space, std::size_t batch_size, bool debug,
                           std::size_t sketch_size, std::size_t oversampling,
                           std::uint64_t seed, bool audit, py::object cvt_weights,
-                          std::size_t cvt_max_iter, double cvt_tol) {
+                          std::size_t cvt_max_iter, double cvt_tol,
+                          const std::vector<double>& axis_weights) {
             auto grid = read_points(points);
             if (weights.ndim() != 1 || weights.shape(0) != points.shape(0))
                 throw std::invalid_argument("expected weights[ngrid]");
@@ -184,7 +185,7 @@ void bind_anchor_select(py::module_& m)
                                    algorithm, coefficients, nocc,
                                    parse_evaluation_space(space), batch_size, debug,
                                    sketch_size, oversampling, seed, audit,
-                                   density, cvt_max_iter, cvt_tol);
+                                   density, cvt_max_iter, cvt_tol, axis_weights);
         }, py::arg("points"), py::arg("weights"), py::arg("axes"),
            py::arg("tolerance") = 1e-10, py::arg("max_rank") = 0,
            py::arg("algorithm") = LocalAnchorSelectionAlgorithm::QRColumnPivoting,
@@ -194,7 +195,7 @@ void bind_anchor_select(py::module_& m)
            py::arg("sketch_size") = 128, py::arg("oversampling") = 16,
            py::arg("seed") = 7, py::arg("audit") = false,
            py::arg("cvt_weights") = py::none(), py::arg("cvt_max_iter") = 100,
-           py::arg("cvt_tol") = 1e-5,
+           py::arg("cvt_tol") = 1e-5, py::arg("axis_weights") = std::vector<double>{},
            "Select original grid indices: QRCP returns pivot order; CVT returns sorted, distinct grid sites. CVT requires max_rank and cvt_weights (density or absolute quadrature weights).")
         .def("evaluate_axis", [](const isdf::AnchorSelection& selector,
                                   const FloatArray& points, py::object axes,

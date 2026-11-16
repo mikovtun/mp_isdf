@@ -24,7 +24,7 @@ class TestAnchorSelection(unittest.TestCase):
         cls.weights = np.array([1., 2., 0., -1., 1., 3., 1., 1.])
 
     def check_reference(self, axes, tolerance=1e-10, max_rank=0, occupied=False,
-                        space="auto"):
+                        space="auto", axis_weights=None):
         good = self.weights != 0
         points = self.points[good]
         ao = self.mol.eval_gto("GTOval_sph", points)
@@ -38,7 +38,12 @@ class TestAnchorSelection(unittest.TestCase):
             mp_isdf.AxisType.AtomicOrbitalGradZ: gradient[2],
             mp_isdf.AxisType.OccupiedOrbital: ao @ c[:, :nocc],
         }
-        columns = np.hstack([pieces[axis] for axis in axes])
+        blocks = [pieces[axis] for axis in axes]
+        if len(blocks) > 1:
+            factors = axis_weights if axis_weights is not None else [1.] * len(blocks)
+            blocks = [factor * block / np.linalg.norm(block)
+                      for factor, block in zip(factors, blocks)]
+        columns = np.hstack(blocks)
         outer = (columns[:, :, None] * columns[:, None, :]).reshape(len(points), -1)
         matrix = (outer * np.sqrt(np.abs(self.weights[good]))[:, None]).T
         _, r, pivots = qr(matrix, pivoting=True, mode="economic")
@@ -51,6 +56,7 @@ class TestAnchorSelection(unittest.TestCase):
             self.points, self.weights, axes, tolerance=tolerance,
             max_rank=max_rank, mo_coeff=c if occupied else None,
             nocc=nocc if occupied else 0, space=space,
+            axis_weights=axis_weights if axis_weights is not None else [],
         )
         self.assertEqual(actual, expected)
         self.assertNotIn(2, actual)  # Original index of the removed zero-weight point.
@@ -108,6 +114,26 @@ class TestAnchorSelection(unittest.TestCase):
         self.check_reference([mp_isdf.AxisType.OccupiedOrbital], occupied=True)
         self.check_reference([mp_isdf.AxisType.OccupiedOrbital,
                               mp_isdf.AxisType.AtomicOrbitalGradY], occupied=True)
+        self.check_reference([mp_isdf.AxisType.AtomicOrbital,
+                              mp_isdf.AxisType.OccupiedOrbital], occupied=True,
+                             axis_weights=[1., 2.], max_rank=3)
+        for algorithm in (mp_isdf.LocalAnchorSelectionAlgorithm.QRColumnPivoting,
+                          mp_isdf.LocalAnchorSelectionAlgorithm.OnlineQRColumnPivoting):
+            result = self.selector.select(self.points, self.weights,
+                [mp_isdf.AxisType.AtomicOrbital, mp_isdf.AxisType.OccupiedOrbital],
+                mo_coeff=self.mean_field.mo_coeff, nocc=1, max_rank=3,
+                axis_weights=[1., 2.], algorithm=algorithm, space="host", batch_size=2)
+            self.assertEqual(result, self.selector.select(self.points, self.weights,
+                [mp_isdf.AxisType.AtomicOrbital, mp_isdf.AxisType.OccupiedOrbital],
+                mo_coeff=self.mean_field.mo_coeff, nocc=1, max_rank=3,
+                axis_weights=[1., 2.], space="host"))
+
+    def test_axis_weight_validation(self):
+        axes = [mp_isdf.AxisType.AtomicOrbital, mp_isdf.AxisType.AtomicOrbitalGradX]
+        for factors in ([1.], [0., 1.], [float('nan'), 1.], [float('inf'), 1.]):
+            with self.assertRaises(ValueError):
+                self.selector.select(self.points, self.weights, axes,
+                                     axis_weights=factors, space="host")
 
     def test_single_axis_and_all_zero_weights(self):
         axis = mp_isdf.AxisType.AtomicOrbital

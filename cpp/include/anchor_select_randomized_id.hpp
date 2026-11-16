@@ -18,7 +18,8 @@ public:
         const std::vector<double>& mo_coeff, std::size_t nocc,
         EvaluationSpace space, std::size_t batch_size, bool debug,
         std::size_t sketch_size, std::size_t oversampling,
-        std::uint64_t seed, bool audit, bool positive_ao_quadrature = false);
+        std::uint64_t seed, bool audit, bool positive_ao_quadrature = false,
+        const std::vector<double>& axis_scales = {});
 
     // Public because CUDA extended lambdas require a public enclosing function.
     template <class Space>
@@ -32,6 +33,6 @@ public:
         const std::vector<double>& mo_coeff, std::size_t nocc,
         std::size_t batch_size, bool debug, std::size_t sketch_size,
         std::size_t oversampling, std::uint64_t seed, bool audit,
-        bool positive_ao_quadrature);
+        bool positive_ao_quadrature, const std::vector<double>& axis_scales);
 };
 } // namespace isdf

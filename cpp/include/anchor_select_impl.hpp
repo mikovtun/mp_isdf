@@ -12,9 +12,11 @@ auto AnchorSelection::evaluate_axis(
     const std::vector<std::array<double, 3>>& points,
     const std::vector<AxisType>& axes,
     const std::vector<double>& mo_coeff,
-    std::size_t nocc) const -> AxisEvaluation<ExecutionSpace>
+    std::size_t nocc, const std::vector<double>& axis_scales) const -> AxisEvaluation<ExecutionSpace>
 {
     const auto spec = axis_spec(axes, mo_coeff, nocc);
+    if (!axis_scales.empty() && axis_scales.size() != axes.size())
+        throw std::invalid_argument("axis scales must match axes");
     if (points.size() > std::numeric_limits<std::size_t>::max() / spec.width) {
         throw std::overflow_error("axis evaluation is too large");
     }
@@ -47,7 +49,11 @@ auto AnchorSelection::evaluate_axis(
                        ? upload(mo_coeff, "axis_mo_coeff")
                        : Kokkos::View<double*, ExecutionSpace>{};
     std::size_t column = 0;
-    for (AxisType axis : axes) {
+    for (std::size_t a = 0; a < axes.size(); ++a) {
+        const AxisType axis = axes[a];
+        const double scale = axis_scales.empty() ? 1.0 : axis_scales[a];
+        if (!std::isfinite(scale) || scale <= 0)
+            throw std::invalid_argument("axis scales must be finite and positive");
         const std::size_t offset = column;
         const std::size_t width = axis == AxisType::OccupiedOrbital ? nocc : nao;
         const std::size_t stride = spec.width;
@@ -67,7 +73,7 @@ auto AnchorSelection::evaluate_axis(
             } else {
                 value = d_grad((component * ng + g) * nao + j);
             }
-            values(g * stride + offset + j) = value;
+            values(g * stride + offset + j) = scale * value;
         });
         column += width;
     }

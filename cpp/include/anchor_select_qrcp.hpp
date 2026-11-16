@@ -21,7 +21,7 @@ public:
         const std::vector<AxisType>& axes,
         double tolerance, std::size_t max_rank,
         const std::vector<double>& mo_coeff, std::size_t nocc,
-        EvaluationSpace space);
+        EvaluationSpace space, const std::vector<double>& axis_scales = {});
 
     // Public because CUDA extended lambdas cannot reside in private methods.
     template <class ExecutionSpace>
@@ -32,7 +32,8 @@ public:
         const std::vector<std::size_t>& original,
         const std::vector<AxisType>& axes,
         double tolerance, std::size_t max_rank,
-        const std::vector<double>& mo_coeff, std::size_t nocc);
+        const std::vector<double>& mo_coeff, std::size_t nocc,
+        const std::vector<double>& axis_scales);
 };
 
 } // namespace isdf

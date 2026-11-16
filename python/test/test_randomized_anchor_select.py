@@ -149,7 +149,8 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
         axes = [self.axis, mp_isdf.AxisType.AtomicOrbitalGradX,
                 mp_isdf.AxisType.OccupiedOrbital]
         opts = dict(mo_coeff=np.eye(3), nocc=1, max_rank=3,
-                    sketch_size=12, oversampling=3, seed=31, batch_size=2)
+                    sketch_size=12, oversampling=3, seed=31, batch_size=2,
+                    axis_weights=[1., 0.5, 2.])
         for space in (("host", "device") if mp_isdf.cuda_enabled else ("host",)):
             result = self.selector.select(
                 self.points, self.weights, axes,
@@ -158,6 +159,11 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
             self.assertEqual(len(result), 3)
             self.assertEqual(len(set(result)), 3)
             self.assertNotIn(2, result)
+            other_batch = self.selector.select(
+                self.points, self.weights, axes,
+                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+                space=space, **(opts | {"batch_size": 5}))
+            self.assertEqual(result, other_batch)
 
     def test_validations_and_optional_audit(self):
         self.assertEqual(len(self.select(space="host", max_rank=2, audit=True)), 2)

@@ -21,9 +21,9 @@ public:
                  const std::vector<double>& weights,
                  const std::vector<AxisType>& axes,
                  const std::vector<double>& coeff, std::size_t nocc,
-                 std::size_t width)
+                 std::size_t width, const std::vector<double>& axis_scales)
         : selector_(selector), points_(points), weights_(weights), axes_(axes),
-          coeff_(coeff), nocc_(nocc), width_(width), rows_(width*width) {}
+          coeff_(coeff), axis_scales_(axis_scales), nocc_(nocc), width_(width), rows_(width*width) {}
 
     // Each call evaluates only the requested grid batch, on the selected space.
     Kokkos::View<double*, Space> columns(const std::vector<std::size_t>& ids) const
@@ -37,7 +37,7 @@ public:
             hw(j) = std::sqrt(std::abs(weights_[ids[j]]));
         }
         Kokkos::deep_copy(w, hw);
-        auto axis = selector_.evaluate_axis<Space>(batch, axes_, coeff_, nocc_);
+        auto axis = selector_.evaluate_axis<Space>(batch, axes_, coeff_, nocc_, axis_scales_);
         auto features = axis.values;
         Kokkos::View<double*, Space> a("online_pair_batch", ids.size()*rows_);
         const std::size_t m = rows_, width = width_;
@@ -103,6 +103,7 @@ private:
     const std::vector<double>& weights_;
     const std::vector<AxisType>& axes_;
     const std::vector<double>& coeff_;
+    const std::vector<double>& axis_scales_;
     std::size_t nocc_, width_, rows_;
 };
 
@@ -129,7 +130,8 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select(
     const std::vector<double>& weights, const std::vector<AxisType>& axes,
     double tolerance, std::size_t max_rank,
     const std::vector<double>& mo_coeff, std::size_t nocc,
-    EvaluationSpace space, std::size_t batch_size, bool debug)
+    EvaluationSpace space, std::size_t batch_size, bool debug,
+    const std::vector<double>& axis_scales)
 {
     if (points.size() != weights.size() || !std::isfinite(tolerance) || tolerance < 0 ||
         batch_size == 0) throw std::invalid_argument("invalid online QR weights, tolerance or batch size");
@@ -160,13 +162,13 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select(
         throw std::overflow_error("online QR batch is too large");
     if (space == EvaluationSpace::Host)
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(
-            selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug);
+            selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug, axis_scales);
 #ifdef ISDF_ENABLE_CUDA
     return select_in_space<Kokkos::Cuda>(
-        selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug);
+        selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug, axis_scales);
 #else
     return select_in_space<Kokkos::DefaultHostExecutionSpace>(
-        selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug);
+        selector, points, weights, original, axes, tolerance, max_rank, mo_coeff, nocc, batch_size, debug, axis_scales);
 #endif
 }
 
@@ -176,11 +178,12 @@ std::vector<std::size_t> OnlineQRAnchorSelection::select_in_space(
     const std::vector<std::array<double, 3>>& points,
     const std::vector<double>& weights, const std::vector<std::size_t>& original,
     const std::vector<AxisType>& axes, double tolerance, std::size_t max_rank,
-    const std::vector<double>& mo_coeff, std::size_t nocc, std::size_t batch_size, bool debug)
+    const std::vector<double>& mo_coeff, std::size_t nocc, std::size_t batch_size, bool debug,
+    const std::vector<double>& axis_scales)
 {
     const auto started = std::chrono::steady_clock::now();
     const std::size_t width = selector.axis_spec(axes, mo_coeff, nocc).width;
-    ColumnStream<Space> stream(selector, points, weights, axes, mo_coeff, nocc, width);
+    ColumnStream<Space> stream(selector, points, weights, axes, mo_coeff, nocc, width, axis_scales);
     const std::size_t m = stream.rows(), n = original.size();
     const std::size_t cap = std::min({m, n, max_rank ? max_rank : std::min(m,n)});
     std::vector<double> estimated(n), reference(n), initial(n);
