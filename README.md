@@ -4,6 +4,75 @@ A C++/Python prototype for **interpolative separable density fitting (ISDF)** of
 
 The default metric is an **integral-direct, unblocked greedy Cholesky** decomposition of AO-pair electron-repulsion integrals (ERIs). An `unblocked_uniform` variant samples eligible pivots uniformly instead of always selecting the largest residual. Neither variant constructs the full AO-pair ERI matrix or calls LAPACK Cholesky. Independent libcint shell quartets and sufficiently large pair updates run on Kokkos host threads; the ordinary metric projection uses batched BLAS++ GEMMs. An approximate grid-based metric is also available. This is a research prototype, not an installed Python package.
 
+## Density-weighted normalized anchor sketches
+
+The AO-only modes `rand_ao_kr_density` (raw control) and
+`rand_ao_kr_density_normalized` (proposed method) share the existing Gaussian
+Khatri–Rao probes and host/device QRCP. For the normalized mode,
+
+```text
+q[g] = sum_mu AO[g,mu]**2
+Y[t,g] = sqrt(m[g] / sketch_rows) * (u[t] @ AO[g]) * (v[t] @ AO[g]) / q[g]
+```
+
+The raw control omits `/ q[g]`. Both require `--axes ao`. By default `m=rho`
+uses the same separate converged RKS B3LYP spin-summed density as density-CVT;
+**quadrature magnitudes are not multiplied into this density-only objective**.
+`--density-weight quadrature_density` instead uses `m=abs(w)*rho`, explicitly
+extending the positive-weight proposal to signed grids. Signed physical weights
+remain unchanged in the refit and Coulomb metric. Existing CVT's
+`--cvt-weight quadrature_weights` continues to mean weights alone, not their product
+with density.
+
+```sh
+OMP_NUM_THREADS=4 OMP_PROC_BIND=false python python/isdf.py \
+  --anchor-algorithm rand_ao_kr_density_normalized --anchor-rank 2 \
+  --anchor-oversampling 16 --ao-screening-threshold 1e-24 \
+  --pair-space-error --compare
+
+# One grid and density, equal ranks/sketch sizes, repeated seeds and cutoffs:
+OMP_NUM_THREADS=4 OMP_PROC_BIND=false python python/compare_density_sketches.py \
+  --rank 2 --seeds 7 11 23 --thresholds 0 1e-24 1e-18 \
+  --output density_sketch_comparison.json
+```
+
+`build_isdf(..., point_importance=m)` accepts the **complete** nonnegative
+importance aligned with the original grid, overriding generated importance for
+CVT and either density sketch. `grid=` can supply a prebuilt PySCF grid for an
+exactly shared comparison. At the extension API use
+`RandomizedAODensityKhatriRao` or `RandomizedAODensityNormalizedKhatriRao`,
+`point_importance=m`, and optionally `ao_screening_threshold`.
+Zero quadrature weight, zero importance, and squared AO norms at or below the
+threshold exclude sites from density-sketch selection. Original grid indices
+are preserved. Screening does not remove nonzero-quadrature sites from the
+physical refit. Explicit rank remains exact (an infeasible rank raises);
+tolerance-only selection uses the sketch Frobenius residual, not a J/K guarantee.
+
+All ordinary scalar refits now solve in physical pair space by SVD (relative
+singular-value cutoff `1e-12`) rather than taking a pseudoinverse of a Gram matrix.
+This deliberately changes rank truncation for ill-conditioned anchors. Stored
+interpolation vectors and metric transforms still use the existing
+anchor-weighted convention; no density/normalization factors enter the physical
+fit. `rbrp-id` retains its own ID path. `fit_diagnostics` reports selected physical
+column singular values, condition, retained rank, and maximum physical coefficient.
+
+With `pair_space_error=True`, density/CVT runs also report
+`pair_space_errors['density_normalized']`: the density-weighted relative-column
+reconstruction residual on points above the AO cutoff, plus included/screened
+importance mass. This is distinct from the ordinary `abs(w)` physical pair
+residual and sketch stopping residual. Small-case `anchor_audit` reports physical
+projection errors and a separate objective-matched direct-QR comparison.
+
+The comparison runner fixes the physical refit, metric, and RHF J/K comparison
+density for all variants. JSON contains separate J/K matrix and restricted-energy
+errors (`E_J=Tr(DJ)/2`, `E_K=-Tr(DK)/4`), pair residuals, conditioning/coefficient
+diagnostics, screening counts, timings, and anchor coordinates for spatial
+inspection. Nonfinite diagnostic values are serialized as `null`. The common
+importance density is RKS B3LYP; it is intentionally distinct from the common
+RHF density used to measure J/K errors. Spatial separation is not enforced, and
+improved normalized residuals alone are not evidence of improved J/K accuracy.
+See [the proposal](density_weighted_normalized_sketch.md) for the objective.
+
 ## Build
 
 Requirements: a C++20 compiler, CMake 3.21+, Git, a BLAS/LAPACK implementation, and Python with NumPy and PySCF. CMake fetches Kokkos, BLAS++, LAPACK++, SLATE, libcint, and pybind11; the initial configure requires network access. OpenMP is enabled by default.
@@ -18,7 +87,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --target mp_isdf_python -j 4
 ```
 
-The Python executable used to run the driver must match the interpreter used to build `mp_isdf`. The driver imports the extension directly from `build/`; no installation step is needed.
+The Python executable used to run the driver must match the interpreter used to build `mp_isdf`. The driver imports the extension directly from `build/`; no installation step is needed. Set `ISDF_BUILD_DIR=/absolute/path/to/build-cpu` to select a different build for the driver and comparison runner.
 
 CUDA and MPI are **on by default**. For a CUDA build, omit `-DISDF_ENABLE_CUDA=OFF`, provide a CUDA toolkit and a suitable `CMAKE_CUDA_ARCHITECTURES` value; the build also obtains and builds MAGMA. MPI may be disabled independently. `--space host` forces host AO evaluation and anchor selection, while `--space device` requires a CUDA build. The integral-direct Cholesky metric itself runs on the host because libcint evaluates its quartets on the CPU.
 

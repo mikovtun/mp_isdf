@@ -24,7 +24,10 @@ void audit_projection(const AnchorSelection& selector,
                       const std::vector<AxisType>& axes,
                       const std::vector<double>& coeff, std::size_t nocc,
                       const std::vector<std::size_t>& selected,
-                      const std::vector<double>& axis_scales)
+                      const std::vector<double>& axis_scales,
+                      const std::vector<double>& importance = {},
+                      const std::vector<double>& ao_norms = {},
+                      const char* objective = "physical_quadrature")
 {
     const std::size_t n = points.size();
     const auto axis = selector.evaluate_axis<Kokkos::DefaultHostExecutionSpace>(
@@ -33,12 +36,13 @@ void audit_projection(const AnchorSelection& selector,
     const std::size_t d = axis.width, m = d*(d+1)/2;
     std::vector<double> matrix(m*n);
     for (std::size_t g = 0; g < n; ++g) {
-        const double w = std::sqrt(std::abs(weights[g]));
+        const double w = std::sqrt(importance.empty() ? std::abs(weights[g]) : importance[g]);
+        const double inverse_norm = ao_norms.empty() ? 1.0 : 1/std::sqrt(ao_norms[g]);
         std::size_t row = 0;
         for (std::size_t mu = 0; mu < d; ++mu)
             for (std::size_t nu = mu; nu < d; ++nu)
-                matrix[g*m+row++] = w*features(g*d+mu)*features(g*d+nu)*
-                    (mu == nu ? 1.0 : std::sqrt(2.0));
+                matrix[g*m+row++] = w*(features(g*d+mu)*inverse_norm)*
+                    (features(g*d+nu)*inverse_norm)*(mu == nu ? 1.0 : std::sqrt(2.0));
     }
     std::vector<double> dense(matrix);
     const auto baseline = detail::qrcp_cpu(dense.data(), m, n);
@@ -77,7 +81,7 @@ void audit_projection(const AnchorSelection& selector,
     std::vector<std::size_t> dense_pivots;
     for (std::size_t j = 0; j < selected.size(); ++j)
         dense_pivots.push_back(static_cast<std::size_t>(baseline[j]-1));
-    std::cerr << "[randomized id audit] rank=" << selected.size()
+    std::cerr << "[randomized id audit] objective=" << objective << " rank=" << selected.size()
               << " actual_projection_relative_error=" << error(selected)
               << " dense_qrcp_projection_relative_error=" << error(dense_pivots)
               << " (equal rank; not ID interpolation error)\n";
@@ -93,12 +97,23 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     const std::vector<double>& mo_coeff, std::size_t nocc,
     EvaluationSpace space, std::size_t batch_size, bool debug,
     std::size_t sketch_size, std::size_t oversampling,
-    std::uint64_t seed, bool audit, bool positive_ao_quadrature,
-    const std::vector<double>& axis_scales)
+    std::uint64_t seed, bool audit, SketchPolicy policy,
+    const std::vector<double>& axis_scales,
+    const std::vector<double>& point_importance, double ao_screening_threshold)
 {
-    if (positive_ao_quadrature &&
+    const bool density = policy == SketchPolicy::AODensity || policy == SketchPolicy::AODensityNormalized;
+    if (density) {
+        if (point_importance.size() != points.size())
+            throw std::invalid_argument("point_importance must have shape (ngrid,)");
+        for (double m : point_importance)
+            if (!std::isfinite(m) || m < 0)
+                throw std::invalid_argument("point_importance must be finite and nonnegative");
+        if (!std::isfinite(ao_screening_threshold) || ao_screening_threshold < 0)
+            throw std::invalid_argument("AO screening threshold must be finite and nonnegative");
+    }
+    if (policy != SketchPolicy::FeatureQuadrature &&
         (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
-        throw std::invalid_argument("quadrature Khatri-Rao sketch requires axes=(ao,)");
+        throw std::invalid_argument("AO Khatri-Rao sketch requires axes=(ao,)");
     if (points.size() != weights.size() || !std::isfinite(tolerance) || tolerance < 0 ||
         batch_size == 0 || oversampling == 0 ||
         (!max_rank && sketch_size <= oversampling))
@@ -115,19 +130,29 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
         points.size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
         throw std::overflow_error("randomized ID dimension exceeds supported range");
     std::vector<std::array<double, 3>> kept_points;
-    std::vector<double> kept_weights;
+    std::vector<double> kept_weights, kept_importance;
     std::vector<std::size_t> original;
     kept_points.reserve(points.size());
     kept_weights.reserve(points.size());
     original.reserve(points.size());
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (!std::isfinite(weights[i])) throw std::invalid_argument("grid weights must be finite");
-        if (weights[i] == 0) continue;
+        if (weights[i] == 0 || (density && point_importance[i] == 0)) continue;
         for (double x : points[i])
             if (!std::isfinite(x)) throw std::invalid_argument("grid coordinates must be finite");
         kept_points.push_back(points[i]);
-        kept_weights.push_back(positive_ao_quadrature ? std::abs(weights[i]) : weights[i]);
+        kept_weights.push_back(weights[i]);
+        if (density) kept_importance.push_back(point_importance[i]);
         original.push_back(i);
+    }
+    if (debug && density) {
+        std::size_t zero_weight = 0, zero_importance = 0;
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            if (weights[i] == 0) ++zero_weight;
+            else if (point_importance[i] == 0) ++zero_importance;
+        }
+        std::cerr << "[density sketch importance] grid_points=" << points.size()
+                  << " zero_weight=" << zero_weight << " zero_importance=" << zero_importance << '\n';
     }
     if (space == EvaluationSpace::Device) {
 #ifndef ISDF_ENABLE_CUDA
@@ -139,7 +164,10 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
     const auto n = original.size(), d = spec.width;
     if (audit && (d*(d+1)/2 > 2000000/std::max<std::size_t>(1,n)))
         throw std::invalid_argument("randomized ID dense audit is limited to 2 million pair-matrix elements");
-    if (n == 0) return {};
+    if (n == 0) {
+        if (density && max_rank) throw std::invalid_argument("requested anchor_rank exceeds eligible candidates");
+        return {};
+    }
     // The pair matrix has only d(d+1)/2 independent rows: drawing more
     // sketch rows cannot increase its rank. Bound dimensions and the total
     // addressable matrix size to the ILP64 QRCP backend's signed index range.
@@ -166,34 +194,79 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
         return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
             kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
             batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-            positive_ao_quadrature, axis_scales);
+            policy, axis_scales, kept_importance, ao_screening_threshold);
 #ifdef ISDF_ENABLE_CUDA
     return select_in_space<Kokkos::Cuda>(selector, kept_points, kept_weights,
         original, axes, tolerance, max_rank, mo_coeff, nocc,
         batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-        positive_ao_quadrature, axis_scales);
+        policy, axis_scales, kept_importance, ao_screening_threshold);
 #else
     return select_in_space<Kokkos::DefaultHostExecutionSpace>(selector, kept_points,
         kept_weights, original, axes, tolerance, max_rank, mo_coeff, nocc,
         batch_size, debug, effective_sketch_size, oversampling, seed, audit,
-        positive_ao_quadrature, axis_scales);
+        policy, axis_scales, kept_importance, ao_screening_threshold);
 #endif
 }
 
 template <class Space>
 std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
     const AnchorSelection& selector,
-    const std::vector<std::array<double, 3>>& points,
-    const std::vector<double>& weights, const std::vector<std::size_t>& original,
+    const std::vector<std::array<double, 3>>& input_points,
+    const std::vector<double>& input_weights, const std::vector<std::size_t>& input_original,
     const std::vector<AxisType>& axes, double tolerance, std::size_t max_rank,
     const std::vector<double>& mo_coeff, std::size_t nocc,
     std::size_t batch_size, bool debug, std::size_t ell, std::size_t oversampling,
-    std::uint64_t seed, bool audit, bool positive_ao_quadrature,
-    const std::vector<double>& axis_scales)
+    std::uint64_t seed, bool audit, SketchPolicy policy,
+    const std::vector<double>& axis_scales,
+    const std::vector<double>& input_importance, double ao_screening_threshold)
 {
     const auto started = std::chrono::steady_clock::now();
     const std::size_t d = selector.axis_spec(axes, mo_coeff, nocc).width;
+    const bool density = policy == SketchPolicy::AODensity || policy == SketchPolicy::AODensityNormalized;
+    const bool normalized = policy == SketchPolicy::AODensityNormalized;
+    auto points = input_points;
+    auto weights = input_weights;
+    auto original = input_original;
+    auto importance = input_importance;
+    std::vector<double> ao_norms;
+    if (density) {
+        // A bounded eligibility pass avoids retaining invalid columns in QRCP.
+        // Only O(Ngrid) norms/indices return to host, never the AO-pair matrix.
+        points.clear(); weights.clear(); original.clear(); importance.clear();
+        for (std::size_t start = 0; start < input_points.size();) {
+            const auto count = std::min(batch_size, input_points.size()-start);
+            std::vector<std::array<double,3>> batch(input_points.begin()+start, input_points.begin()+start+count);
+            const auto axis = selector.evaluate_axis<Space>(batch, axes, mo_coeff, nocc, axis_scales);
+            const auto phi = axis.values;
+            Kokkos::View<double*, Space> norms("id_ao_norms", count);
+            Kokkos::parallel_for("id_ao_norm", Kokkos::RangePolicy<Space>(0,count),
+                KOKKOS_LAMBDA(const std::size_t g) {
+                    double q = 0;
+                    for (std::size_t a = 0; a < d; ++a) q += phi(g*d+a)*phi(g*d+a);
+                    norms(g) = q;
+                });
+            const auto hn = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, norms);
+            for (std::size_t g = 0; g < count; ++g) {
+                const double q = hn(g);
+                if (!std::isfinite(q)) throw std::overflow_error("non-finite AO squared norm");
+                if (q <= ao_screening_threshold) continue;
+                points.push_back(input_points[start+g]);
+                weights.push_back(input_weights[start+g]);
+                original.push_back(input_original[start+g]);
+                importance.push_back(input_importance[start+g]);
+                ao_norms.push_back(q);
+            }
+            start += count;
+        }
+    }
     const std::size_t n = original.size();
+    if (max_rank > std::min(n, d*(d+1)/2))
+        throw std::invalid_argument("requested anchor_rank exceeds eligible candidates or physical pair rank");
+    if (debug && density)
+        std::cerr << "[density sketch screening] candidates=" << input_points.size()
+                  << " eligible=" << n << " screened_ao=" << input_points.size()-n
+                  << " ao_norm2_threshold=" << ao_screening_threshold << '\n';
+    if (n == 0) return {};
     Kokkos::View<double*, Space> u("id_random_u", d*ell), v("id_random_v", d*ell);
     auto hu = Kokkos::create_mirror_view(u), hv = Kokkos::create_mirror_view(v);
     // Stable across batch sizes; two independent streams of random factors.
@@ -211,20 +284,25 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         std::vector<std::array<double,3>> batch(points.begin()+start, points.begin()+start+count);
         auto axis = selector.evaluate_axis<Space>(batch, axes, mo_coeff, nocc, axis_scales);
         auto phi = axis.values;
-        Kokkos::View<double*, Space> sw("id_weights", count);
+        Kokkos::View<double*, Space> sw("id_weights", count), inv_norm("id_inv_norm", count);
         auto hw = Kokkos::create_mirror_view(sw);
-        // Positive AO mode uses sqrt(w); the feature mode retains sqrt(abs(w)).
-        for (std::size_t g = 0; g < count; ++g)
-            hw(g) = std::sqrt(std::abs(weights[start+g]));
+        auto hi = Kokkos::create_mirror_view(inv_norm);
+        for (std::size_t g = 0; g < count; ++g) {
+            hw(g) = std::sqrt(density ? importance[start+g] : std::abs(weights[start+g]));
+            // Normalize AO values before projection to avoid tiny-denominator
+            // products. This is algebraically division of the pair column by q.
+            hi(g) = normalized ? 1/std::sqrt(ao_norms[start+g]) : 1.0;
+        }
         Kokkos::deep_copy(sw, hw);
+        Kokkos::deep_copy(inv_norm, hi);
         const double scaling = 1/std::sqrt(static_cast<double>(ell));
-        using SketchPolicy = Kokkos::RangePolicy<Space, Kokkos::IndexType<std::size_t>>;
-        Kokkos::parallel_for("id_factored_sketch", SketchPolicy(0,count*ell),
+        using SketchRange = Kokkos::RangePolicy<Space, Kokkos::IndexType<std::size_t>>;
+        Kokkos::parallel_for("id_factored_sketch", SketchRange(0,count*ell),
             KOKKOS_LAMBDA(const std::size_t i) {
                 const std::size_t g = i/ell, s = i%ell;
                 double left = 0, right = 0;
                 for (std::size_t a = 0; a < d; ++a) {
-                    const double value = phi(g*d+a);
+                    const double value = phi(g*d+a)*inv_norm(g);
                     left += value*u(a*ell+s);
                     right += value*v(a*ell+s);
                 }
@@ -233,7 +311,7 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         std::size_t bad = 0;
         // Check this batch using local indices. Absolute sketch offsets can
         // exceed INT_MAX even when a bounded batch is small (e.g. 50k x 43k).
-        Kokkos::parallel_reduce("id_check_sketch", SketchPolicy(0,count*ell),
+        Kokkos::parallel_reduce("id_check_sketch", SketchRange(0,count*ell),
             KOKKOS_LAMBDA(const std::size_t i, std::size_t& invalid) {
                 if (!Kokkos::isfinite(y(start*ell+i))) ++invalid;
             }, bad);
@@ -296,7 +374,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         selected.push_back(original[static_cast<std::size_t>(jpvt[i]-1)]);
     }
     if (debug) {
-        std::cerr << (positive_ao_quadrature ? "[rand_ao_kr_quadrature]" : "[rand_feature_kr]")
+        std::cerr << (normalized ? "[rand_ao_kr_density_normalized]" : density ? "[rand_ao_kr_density]"
+                      : policy == SketchPolicy::AOQuadrature ? "[rand_ao_kr_quadrature]" : "[rand_feature_kr]")
                   << " rank=" << rank << " sketch_size=" << ell
                   << " oversampling=" << oversampling << " columns=" << n
                   << " sketch_relative_frobenius=" << (norm ? tails[rank]/norm : 0)
@@ -315,6 +394,10 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
             local.push_back(static_cast<std::size_t>(
                 std::lower_bound(original.begin(), original.end(), id)-original.begin()));
         audit_projection(selector, points, weights, axes, mo_coeff, nocc, local, axis_scales);
+        if (density)
+            audit_projection(selector, points, weights, axes, mo_coeff, nocc, local, axis_scales,
+                importance, normalized ? ao_norms : std::vector<double>{},
+                normalized ? "density_normalized" : "density_raw");
     }
     // Future full-ID continuation: retain y's packed QR, jpvt, and QR tau in a
     // result object, then solve R11 * X = R[:rank,:] in grid batches. No A^T A.

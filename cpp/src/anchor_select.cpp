@@ -87,8 +87,14 @@ std::vector<std::size_t> AnchorSelection::select(
     std::size_t nocc, EvaluationSpace space, std::size_t batch_size, bool debug,
     std::size_t sketch_size, std::size_t oversampling, std::uint64_t seed, bool audit,
     const std::vector<double>& cvt_weights, std::size_t cvt_max_iter, double cvt_tol,
-    const std::vector<double>& axis_weights) const
+    const std::vector<double>& axis_weights,
+    const std::vector<double>& point_importance, double ao_screening_threshold) const
 {
+    const bool density_sketch =
+        algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao ||
+        algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao;
+    if (density_sketch && (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
+        throw std::invalid_argument("density Khatri-Rao sketch requires axes=(ao,)");
     if (!axis_weights.empty() && axis_weights.size() != axes.size())
         throw std::invalid_argument("axis weights must match axes");
     for (double weight : axis_weights)
@@ -148,10 +154,18 @@ std::vector<std::size_t> AnchorSelection::select(
                                                max_rank, mo_coeff, nocc, space, batch_size, debug, scales);
     case LocalAnchorSelectionAlgorithm::RandomizedFeatureKhatriRao:
     case LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao:
+    case LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao:
+    case LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao:
         return RandomizedIDAnchorSelection::select(*this, points, weights, axes, tolerance,
             max_rank, mo_coeff, nocc, space, batch_size, debug,
             sketch_size, oversampling, seed, audit,
-            algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao, scales);
+            algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao
+                ? SketchPolicy::AODensityNormalized
+                : algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao
+                ? SketchPolicy::AODensity
+                : algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao
+                ? SketchPolicy::AOQuadrature : SketchPolicy::FeatureQuadrature,
+            scales, point_importance, ao_screening_threshold);
     case LocalAnchorSelectionAlgorithm::CentroidalVoronoi:
         return CVTAnchorSelection::select(points, weights, cvt_weights, max_rank,
                                           space, seed, cvt_max_iter, cvt_tol, debug);

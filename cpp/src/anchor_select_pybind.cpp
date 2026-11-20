@@ -150,7 +150,9 @@ void bind_anchor_select(py::module_& m)
         .value("OnlineQRColumnPivoting", LocalAnchorSelectionAlgorithm::OnlineQRColumnPivoting)
         .value("RandomizedFeatureKhatriRao", LocalAnchorSelectionAlgorithm::RandomizedFeatureKhatriRao)
         .value("RandomizedAOQuadratureKhatriRao", LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao)
-        .value("CentroidalVoronoi", LocalAnchorSelectionAlgorithm::CentroidalVoronoi);
+        .value("CentroidalVoronoi", LocalAnchorSelectionAlgorithm::CentroidalVoronoi)
+        .value("RandomizedAODensityKhatriRao", LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao)
+        .value("RandomizedAODensityNormalizedKhatriRao", LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao);
     py::enum_<DistributedAnchorSelectionAlgorithm>(m, "DistributedAnchorSelectionAlgorithm")
         .value("SVD", DistributedAnchorSelectionAlgorithm::SVD)
         .value("RandomizedQRColumnPivoting", DistributedAnchorSelectionAlgorithm::RandomizedQRColumnPivoting);
@@ -167,7 +169,8 @@ void bind_anchor_select(py::module_& m)
                           std::size_t sketch_size, std::size_t oversampling,
                           std::uint64_t seed, bool audit, py::object cvt_weights,
                           std::size_t cvt_max_iter, double cvt_tol,
-                          const std::vector<double>& axis_weights) {
+                          const std::vector<double>& axis_weights,
+                          py::object point_importance, double ao_screening_threshold) {
             auto grid = read_points(points);
             if (weights.ndim() != 1 || weights.shape(0) != points.shape(0))
                 throw std::invalid_argument("expected weights[ngrid]");
@@ -181,11 +184,19 @@ void bind_anchor_select(py::module_& m)
                     throw std::invalid_argument("cvt_weights must have shape (ngrid,)");
                 density.assign(input.data(), input.data() + input.size());
             }
+            std::vector<double> importance;
+            if (!point_importance.is_none()) {
+                auto input = point_importance.cast<FloatArray>();
+                if (input.ndim() != 1 || input.shape(0) != points.shape(0))
+                    throw std::invalid_argument("point_importance must have shape (ngrid,)");
+                importance.assign(input.data(), input.data() + input.size());
+            }
             return selector.select(grid, w, axis_list, tolerance, max_rank,
                                    algorithm, coefficients, nocc,
                                    parse_evaluation_space(space), batch_size, debug,
                                    sketch_size, oversampling, seed, audit,
-                                   density, cvt_max_iter, cvt_tol, axis_weights);
+                                   density, cvt_max_iter, cvt_tol, axis_weights,
+                                   importance, ao_screening_threshold);
         }, py::arg("points"), py::arg("weights"), py::arg("axes"),
            py::arg("tolerance") = 1e-10, py::arg("max_rank") = 0,
            py::arg("algorithm") = LocalAnchorSelectionAlgorithm::QRColumnPivoting,
@@ -196,7 +207,8 @@ void bind_anchor_select(py::module_& m)
            py::arg("seed") = 7, py::arg("audit") = false,
            py::arg("cvt_weights") = py::none(), py::arg("cvt_max_iter") = 100,
            py::arg("cvt_tol") = 1e-5, py::arg("axis_weights") = std::vector<double>{},
-           "Select original grid indices: QRCP returns pivot order; CVT returns sorted, distinct grid sites. CVT requires max_rank and cvt_weights (density or absolute quadrature weights).")
+           py::arg("point_importance") = py::none(), py::arg("ao_screening_threshold") = 1e-24,
+           "Select original grid indices: QRCP returns pivot order; CVT returns sorted, distinct grid sites. CVT requires max_rank and cvt_weights. Density sketches require AO-only axes and complete nonnegative point_importance; ao_screening_threshold applies to sum(AO**2), and quadrature weights only gate zero-weight sites.")
         .def("evaluate_axis", [](const isdf::AnchorSelection& selector,
                                   const FloatArray& points, py::object axes,
                                   py::object mo_coeff, std::size_t nocc,

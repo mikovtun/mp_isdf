@@ -43,10 +43,9 @@ class TestMinimalISDF(unittest.TestCase):
         ao = context.eval_ao(result["coordinates"])
         products = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
         anchor_ao = result["X1"]
-        weighted_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, -1)
-        weighted_pairs *= result["anchor_weights"][:, None]
-        transform = np.linalg.pinv(weighted_pairs @ weighted_pairs.T, rcond=1e-12) @ weighted_pairs
-        expected_interp = (products @ transform.T).T
+        pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, -1)
+        physical = np.linalg.lstsq(pairs.T, products.T, rcond=1e-12)[0]
+        expected_interp = physical / result["anchor_weights"][:, None]
         np.testing.assert_allclose(result["interp_vecs"], expected_interp, rtol=1e-12, atol=1e-12)
         approx = anchor_ao.T @ (
             (result["anchor_weights"] * (result["interp_vecs"] @ result["weights"]))[:, None]
@@ -82,9 +81,8 @@ class TestMinimalISDF(unittest.TestCase):
                 pair_grid = (ao[:, :, None] * ao[:, None, :]).reshape(len(ao), -1)
                 pair_anchor = (anchors[:, :, None] * anchors[:, None, :]).reshape(
                     len(anchors), -1)
-                weighted = pair_anchor * result["anchor_weights"][:, None]
-                reference = (pair_grid @ (np.linalg.pinv(
-                    weighted @ weighted.T, rcond=1e-12) @ weighted).T).T
+                reference = np.linalg.lstsq(pair_anchor.T, pair_grid.T, rcond=1e-12)[0]
+                reference /= result["anchor_weights"][:, None]
                 np.testing.assert_allclose(result["interp_vecs"], reference,
                                            rtol=1e-11, atol=1e-11)
                 gradients = context.eval_ao_gradient(result["coordinates"])

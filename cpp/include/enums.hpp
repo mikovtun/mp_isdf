@@ -25,7 +25,9 @@ enum class LocalAnchorSelectionAlgorithm {
   OnlineQRColumnPivoting,
   RandomizedFeatureKhatriRao,
   RandomizedAOQuadratureKhatriRao,
-  CentroidalVoronoi
+  CentroidalVoronoi,
+  RandomizedAODensityKhatriRao,
+  RandomizedAODensityNormalizedKhatriRao
 };
 
 

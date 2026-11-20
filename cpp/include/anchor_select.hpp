@@ -66,7 +66,10 @@ public:
     // nocc columns. Supply both if OccupiedOrbital is requested. Unused otherwise.
     // axis_weights, if given, has one finite positive factor per axis occurrence;
     // multiple axes are normalized globally before selection (single axis unchanged).
-    // tolerance is relative to abs(R[0,0]); max_rank=0 means no explicit cap.
+    // Dense tolerance is relative to abs(R[0,0]); randomized tolerance is a
+    // relative sketch Frobenius norm. Randomized max_rank>0 is an exact rank.
+    // Density sketches consume complete nonnegative point_importance (no extra
+    // quadrature factor), and screen sum(AO^2) <= ao_screening_threshold.
     std::vector<std::size_t> select(
         const std::vector<std::array<double, 3>>& points,
         const std::vector<double>& weights,
@@ -82,7 +85,9 @@ public:
         std::uint64_t seed = 7, bool audit = false,
         const std::vector<double>& cvt_weights = {},
         std::size_t cvt_max_iter = 100, double cvt_tol = 1e-5,
-        const std::vector<double>& axis_weights = {}) const;
+        const std::vector<double>& axis_weights = {},
+        const std::vector<double>& point_importance = {},
+        double ao_screening_threshold = 1e-24) const;
 
 private:
     friend class QRCPAnchorSelection;

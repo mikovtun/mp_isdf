@@ -14,14 +14,19 @@ Example: OMP_PROC_BIND=false python python/isdf.py --level 0 --anchor-rank 0
 import argparse
 from itertools import combinations, product
 from pathlib import Path
+import os
 import sys
 import time
 
 import numpy as np
 from pyscf import dft, gto, scf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+sys.path.insert(0, os.environ.get("ISDF_BUILD_DIR", str(Path(__file__).resolve().parents[1] / "build")))
 import mp_isdf
+
+
+DENSITY_SKETCHES = ("rand_ao_kr_density", "rand_ao_kr_density_normalized")
+SKETCH_ALGORITHMS = ("rand_feature_kr", "rand_ao_kr_quadrature", *DENSITY_SKETCHES)
 
 
 AXES = {
@@ -179,11 +184,106 @@ def _stream_pair_space_error_norms(left, right, pair_anchor, anchor_weights,
     return {"l2": absolute, "relative": relative}
 
 
+def prepare_point_importance(mol, coords, weights, *, level=0,
+                             convention="electron_density", batch_size=128):
+    """Complete nonnegative selection importance on the original grid.
+
+    Density comes from a separate converged RKS B3LYP calculation, matching CVT.
+    Signed quadrature is used only through abs(w) for positive importance.
+    """
+    if convention not in ("electron_density", "quadrature_density", "quadrature_weights"):
+        raise ValueError("unknown importance convention")
+    if batch_size < 1:
+        raise ValueError("importance batch_size must be positive")
+    weights = np.asarray(weights, dtype=np.float64)
+    if not np.isfinite(weights).all():
+        raise ValueError("grid weights must be finite")
+    if convention == "quadrature_weights":
+        return np.abs(weights)
+    rks = dft.RKS(mol)
+    rks.xc = "b3lyp"
+    rks.grids.level = level
+    rks.kernel()
+    if not rks.converged:
+        raise RuntimeError("RKS B3LYP did not converge for selection density")
+    dm = rks.make_rdm1()
+    importance = np.zeros(len(coords), dtype=np.float64)
+    eligible = np.flatnonzero(weights != 0)
+    for first in range(0, len(eligible), batch_size):
+        ids = eligible[first:first + batch_size]
+        ao = dft.numint.eval_ao(mol, coords[ids])
+        rho = dft.numint.eval_rho(mol, ao, dm)
+        if not np.isfinite(rho).all():
+            raise ValueError("selection density must be finite")
+        importance[ids] = np.maximum(rho, 0.0)
+    if convention == "quadrature_density":
+        importance *= np.abs(weights)
+    return importance
+
+
+def _validate_point_importance(importance, ngrid):
+    importance = np.asarray(importance, dtype=np.float64)
+    if importance.shape != (ngrid,) or not np.isfinite(importance).all() or np.any(importance < 0):
+        raise ValueError("point_importance must be a finite nonnegative array of shape (ngrid,)")
+    return np.ascontiguousarray(importance)
+
+
+def _physical_pair_refit(anchor_pairs, anchor_weights, ao, batch_size):
+    """SVD solve C X ~= A, then store theta = diag(w_J)^-1 X.
+
+    No normal equations. Only a bounded grid-pair batch is materialized.
+    The metric transform uses the same weighted-anchor storage convention.
+    """
+    u, s, vh = np.linalg.svd(anchor_pairs.T, full_matrices=False)
+    retained = s > (1e-12 * s[0] if len(s) else 0)
+    physical_transform = (vh[retained].T / s[retained]) @ u[:, retained].T
+    transform = physical_transform / anchor_weights[:, None]
+    theta = np.empty((len(anchor_weights), len(ao)), dtype=np.float64)
+    batch_size = min(batch_size, max(1, 8_000_000 // anchor_pairs.shape[1]))
+    coefficient_max = 0.0
+    for first in range(0, len(ao), batch_size):
+        block = ao[first:first + batch_size]
+        pairs = (block[:, :, None] * block[:, None, :]).reshape(len(block), -1)
+        physical_coeff = physical_transform @ pairs.T
+        coefficient_max = max(coefficient_max, float(np.max(np.abs(physical_coeff))))
+        theta[:, first:first + len(block)] = physical_coeff / anchor_weights[:, None]
+    diagnostics = {
+        "retained_rank": int(np.count_nonzero(retained)),
+        "condition": float(s[0] / s[-1]) if len(s) and s[-1] > 0 else float("inf"),
+        "singular_values": s,
+        "max_abs_physical_coefficient": coefficient_max,
+    }
+    return theta, transform, diagnostics
+
+
+def _normalized_pair_error(ao, anchor_pairs, anchor_weights, theta, importance, threshold):
+    """Density-weighted relative-column reconstruction in physical coordinates."""
+    residual_sq = total = 0.0
+    screened_mass = 0.0
+    for g, row in enumerate(ao):
+        q = np.dot(row, row)
+        m = importance[g]
+        if q <= threshold:
+            screened_mass += m
+            continue
+        if m == 0:
+            continue
+        exact = np.outer(row, row).ravel()
+        reconstructed = (anchor_weights * theta[:, g]) @ anchor_pairs
+        residual_sq += m * np.sum(((exact - reconstructed) / q)**2)
+        total += m
+    return {"l2": float(np.sqrt(residual_sq)),
+            "relative": float(np.sqrt(residual_sq / total)) if total else 0.0,
+            "included_mass": float(total), "screened_mass": float(screened_mass)}
+
+
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                axes=("ao",), axis_weights=None, compute_metric=True, space="auto",
                anchor_algorithm="dense", anchor_batch_size=128, fit_batch_size=2048,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
+               point_importance=None, density_weight="electron_density",
+               ao_screening_threshold=1e-24,
                rbrp_block_size=16, rbrp_tau_block=None,
                rbrp_rank_rtol=1e-12, rbrp_refresh_every=8,
                rbrp_svd_rtol=1e-12,
@@ -191,7 +291,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                metric_algorithm="unblocked_greedy", metric_tol=1e-12,
                metric_rank=0, metric_batch_size=64, report_timings=False,
                derivative_targets=(), selection_only=False, debug=False,
-               metric_seed=0, pair_space_error=False, report_dimensions=False):
+               metric_seed=0, pair_space_error=False, report_dimensions=False, grid=None):
     """Build AO-pair ISDF, using this project's C++ evaluator and selector.
 
     `axes` selects the anchor-search features (ao/dx/dy/dz/occ), concatenated
@@ -218,6 +318,17 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     absolute quadrature weights as its importance vector, not their product.
     Zero quadrature-weight and zero-importance sites are excluded from
     clustering and snapping.
+    `rand_ao_kr_density` uses sqrt(m/ell) times raw AO pairs;
+    `rand_ao_kr_density_normalized` additionally divides each pair column by
+    sum(ao**2). Both require axes=('ao',). `density_weight` chooses density alone
+    (default) or abs(quadrature_weight)*density. `point_importance`, if supplied,
+    is the complete m on the original grid and overrides importance generation
+    for CVT and density sketches. No further quadrature scaling is applied.
+    `ao_screening_threshold` screens squared AO norms during density-sketch
+    selection only. All nonzero-weight points remain in the physical refit.
+    `grid` may supply a prebuilt PySCF grid for controlled comparisons.
+    All ordinary scalar refits use a physical-pair SVD with relative cutoff 1e-12;
+    stored interpolation vectors retain the anchor-weighted convention.
     `anchor_batch_size` controls selection streaming; `fit_batch_size` controls
     interpolation-vector batches without materializing grid-wide AO pairs.
     RBRP uses sqrt(abs(grid_weight)) in its AO-pair rows, skips zero weights,
@@ -282,7 +393,16 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         if len(axis_weights) != len(axis_types) or not all(
                 np.isfinite(w) and w > 0 for w in axis_weights):
             raise ValueError("axis_weights must contain one finite positive factor per axis")
-    sketch_algorithms = ("rand_feature_kr", "rand_ao_kr_quadrature")
+    sketch_algorithms = SKETCH_ALGORITHMS
+    density_sketch = anchor_algorithm in DENSITY_SKETCHES
+    if density_sketch and axis_types != [mp_isdf.AxisType.AtomicOrbital]:
+        raise ValueError("density sketches require axes=('ao',)")
+    if density_weight not in ("electron_density", "quadrature_density"):
+        raise ValueError("density_weight must be electron_density or quadrature_density")
+    if not np.isfinite(ao_screening_threshold) or ao_screening_threshold < 0:
+        raise ValueError("ao_screening_threshold must be finite and nonnegative")
+    if point_importance is not None and not (density_sketch or anchor_algorithm == "cvt"):
+        raise ValueError("point_importance requires CVT or a density sketch")
     rbrp_mode = anchor_algorithm in ("rbrp", "rbrp-id")
     if anchor_algorithm not in ("dense", "online", "cvt", "rbrp", "rbrp-id", *sketch_algorithms):
         raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}")
@@ -347,9 +467,12 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     scalar_target_requested = "0000" in derivative_targets
     derivative_targets = tuple(t for t in derivative_targets if t != "0000")
 
-    grids = dft.gen_grid.Grids(mol)
-    grids.level = level
-    grids.build()
+    if grid is None:
+        grids = dft.gen_grid.Grids(mol)
+        grids.level = level
+        grids.build()
+    else:
+        grids = grid
     all_coords = np.ascontiguousarray(grids.coords, dtype=np.float64)
     all_weights = np.ascontiguousarray(grids.weights, dtype=np.float64)
     keep = all_weights != 0
@@ -387,6 +510,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                            f" sketch_rank_cap={sketch_cap}"
                            f" sketch_matrix={ell}x{int(np.count_nonzero(keep))}"
                            f" sketch_storage={ell * int(np.count_nonzero(keep)) * 8 / 2**20:.1f}MiB")
+            if density_sketch:
+                dimensions += " (pre-screening estimate; --debug reports eligible columns)"
             if anchor_rank > 0:
                 dimensions += f" requested_rank={anchor_rank}"
                 if anchor_rank > sketch_cap:
@@ -399,6 +524,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         "online": "OnlineQRColumnPivoting",
         "rand_feature_kr": "RandomizedFeatureKhatriRao",
         "rand_ao_kr_quadrature": "RandomizedAOQuadratureKhatriRao",
+        "rand_ao_kr_density": "RandomizedAODensityKhatriRao",
+        "rand_ao_kr_density_normalized": "RandomizedAODensityNormalizedKhatriRao",
         "cvt": "CentroidalVoronoi",
     }
     if not rbrp_mode:
@@ -408,22 +535,17 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         except AttributeError as exc:
             raise RuntimeError("rebuild the mp_isdf extension to use this anchor algorithm") from exc
     cvt_weights = None
-    if anchor_algorithm == "cvt":
-        cvt_weights = np.zeros(len(all_coords), dtype=np.float64)
-        if cvt_weight == "quadrature_weights":
-            cvt_weights[keep] = np.abs(all_weights[keep])
-        else:
-            rks = dft.RKS(mol)
-            rks.xc = "b3lyp"
-            rks.grids.level = level
-            rks.kernel()
-            if not rks.converged:
-                raise RuntimeError("RKS B3LYP did not converge for CVT density")
-            # Spin-summed electron density on the same PySCF grid as selection.
-            ao_cvt = dft.numint.eval_ao(mol, all_coords[keep])
-            cvt_weights[keep] = np.maximum(
-                dft.numint.eval_rho(mol, ao_cvt, rks.make_rdm1()), 0.0)
-        record("cvt_weights")
+    importance = None
+    if anchor_algorithm == "cvt" or density_sketch:
+        convention = cvt_weight if anchor_algorithm == "cvt" else density_weight
+        importance = (_validate_point_importance(point_importance, len(all_coords))
+                      if point_importance is not None else
+                      prepare_point_importance(mol, all_coords, all_weights, level=level,
+                                               convention=convention, batch_size=anchor_batch_size))
+        importance = _validate_point_importance(importance, len(all_coords))
+        if anchor_algorithm == "cvt":
+            cvt_weights = importance
+        record("point_importance")
     rbrp_result = None
     rbrp_ao = None
     if rbrp_mode:
@@ -460,6 +582,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             seed=anchor_seed, audit=anchor_audit,
             cvt_weights=cvt_weights, cvt_max_iter=cvt_max_iter, cvt_tol=cvt_tol,
             axis_weights=axis_weights if axis_weights is not None else [],
+            point_importance=importance if density_sketch else None,
+            ao_screening_threshold=ao_screening_threshold,
         ), dtype=np.intp)
     if len(anchor_indices) == 0:
         raise ValueError("anchor selection found no anchors; adjust settings or grid")
@@ -467,6 +591,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     if selection_only:
         return {
             "anchor_indices": anchor_indices,
+            "point_importance": importance,
+            "fit_diagnostics": None,
             "rbrp_diagnostics": ({key: rbrp_result[key] for key in
                                   ("relative_residual", "status", "history")}
                                  if rbrp_mode else None),
@@ -497,6 +623,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     rank, nao = anchor_ao.shape
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
     id_info = None
+    fit_diagnostics = None
     if anchor_algorithm == "rbrp-id":
         # Algorithm 5.1: reuse L and Q; no NumPy AO-pair Gram fit.
         interp_vecs = rbrp_result["interp_vecs"]
@@ -506,17 +633,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         if debug:
             print(f"[rbrp-id] {id_info}", flush=True)
     else:
-        weighted_pairs = anchor_pairs * anchor_weights[:, None]
-        gram = weighted_pairs @ weighted_pairs.T
-        gram_inverse = np.linalg.pinv(gram, rcond=1e-12)
-        transform = gram_inverse @ weighted_pairs
-        # P(grid) @ (W P(anchor)).T equals (AO(grid) @ AO(anchor).T)**2 * W.
-        interp_vecs = np.empty((rank, len(coords)), dtype=np.float64)
-        for first in range(0, len(coords), fit_batch_size):
-            stop = min(first + fit_batch_size, len(coords))
-            cross = (ao[first:stop] @ anchor_ao.T)**2
-            cross *= anchor_weights[None, :]
-            interp_vecs[:, first:stop] = gram_inverse @ cross.T
+        interp_vecs, transform, fit_diagnostics = _physical_pair_refit(
+            anchor_pairs, anchor_weights, ao, fit_batch_size)
     record("isdf_fit")
     pair_space_errors = None
     if pair_space_error:
@@ -524,6 +642,9 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             "scalar": _stream_pair_space_error_norms(
                 ao, ao, anchor_pairs, anchor_weights, interp_vecs, weights)
         }
+        if importance is not None:
+            pair_space_errors["density_normalized"] = _normalized_pair_error(
+                ao, anchor_pairs, anchor_weights, interp_vecs, importance[keep], ao_screening_threshold)
         record("pair_space_check")
 
     overlap = mol.intor("int1e_ovlp")
@@ -639,6 +760,8 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             record("derivative_integrals")
     return {
         "anchor_indices": anchor_indices,
+        "point_importance": importance,
+        "fit_diagnostics": fit_diagnostics,
         "rbrp_diagnostics": ({"relative_residual": rbrp_result["relative_residual"],
                               "status": rbrp_result["status"],
                               "history": rbrp_result["history"],
@@ -694,7 +817,7 @@ def main():
     parser.add_argument("--anchor-tol", type=float, default=None,
                         help="stop at this relative QR/sketch residual tolerance (default: 1e-10 if rank omitted)")
     parser.add_argument("--anchor-algorithm",
-                        choices=("dense", "online", "rand_feature_kr", "rand_ao_kr_quadrature", "cvt", "rbrp", "rbrp-id"),
+                        choices=("dense", "online", *SKETCH_ALGORITHMS, "cvt", "rbrp", "rbrp-id"),
                         default="dense", help="rbrp selects anchors and uses the existing fit; rbrp-id uses Algorithm 5.1 ID coefficients")
     parser.add_argument("--rbrp-block-size", type=int, default=16)
     parser.add_argument("--rbrp-tau-block", type=float, default=None,
@@ -712,6 +835,10 @@ def main():
                         help="rand sketch extra rows beyond explicit rank (default: 16)")
     parser.add_argument("--anchor-seed", type=int, default=7,
                         help="rand sketch/CVT anchor seed (default: 7)")
+    parser.add_argument("--density-weight", choices=("electron_density", "quadrature_density"),
+                        default="electron_density", help="density sketch importance: rho or abs(w)*rho")
+    parser.add_argument("--ao-screening-threshold", type=float, default=1e-24,
+                        help="density sketch squared AO norm cutoff (selection only)")
     parser.add_argument("--cvt-weight", choices=("electron_density", "quadrature_weights"),
                         default="electron_density",
                         help="CVT importance: RKS B3LYP electron density or absolute quadrature weights")
@@ -759,12 +886,14 @@ def main():
     if args.fit_batch_size <= 0:
         parser.error("--fit-batch-size must be positive")
     if args.anchor_sketch_size < 1 or args.anchor_oversampling < 1 or (
-            args.anchor_algorithm in ("rand_feature_kr", "rand_ao_kr_quadrature") and args.anchor_rank == 0 and
+            args.anchor_algorithm in SKETCH_ALGORITHMS and args.anchor_rank == 0 and
             args.anchor_sketch_size <= args.anchor_oversampling):
         parser.error("randomized sketch size must exceed oversampling when --anchor-rank=0")
     if not 0 <= args.anchor_seed < 2**64:
         parser.error("--anchor-seed must be an unsigned 64-bit integer")
-    if args.anchor_audit and args.anchor_algorithm not in ("rand_feature_kr", "rand_ao_kr_quadrature"):
+    if not np.isfinite(args.ao_screening_threshold) or args.ao_screening_threshold < 0:
+        parser.error("--ao-screening-threshold must be finite and nonnegative")
+    if args.anchor_audit and args.anchor_algorithm not in SKETCH_ALGORITHMS:
         parser.error("--anchor-audit requires a rand sketch anchor algorithm")
     if args.anchor_rank != 0 and args.anchor_tol is not None:
         parser.error("--anchor-rank and --anchor-tol are mutually exclusive")
@@ -814,6 +943,8 @@ def main():
                         anchor_sketch_size=args.anchor_sketch_size,
                         anchor_oversampling=args.anchor_oversampling,
                         anchor_seed=args.anchor_seed, anchor_audit=args.anchor_audit,
+                        density_weight=args.density_weight,
+                        ao_screening_threshold=args.ao_screening_threshold,
                         rbrp_block_size=args.rbrp_block_size,
                         rbrp_tau_block=args.rbrp_tau_block,
                         rbrp_rank_rtol=args.rbrp_rank_rtol,
