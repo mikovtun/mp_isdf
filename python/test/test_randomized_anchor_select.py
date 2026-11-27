@@ -40,7 +40,7 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
     def select(self, **kwargs):
         return self.selector.select(
             self.points, self.weights, self.axis,
-            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
             sketch_size=12, oversampling=3, seed=31, **kwargs)
 
     def test_pivots_and_real_pair_projection(self):
@@ -72,26 +72,40 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
             for batch in (1, 5, 19):
                 opts = dict(max_rank=3, oversampling=4, sketch_size=1,
                             seed=31, space=space, batch_size=batch)
-                strict = self.selector.select(
+                selected = self.selector.select(
                     self.points, positive, self.axis,
-                    algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
+                    algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
                     **opts)
-                general = self.selector.select(
-                    self.points, positive, self.axis,
-                    algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
-                    **opts)
-                self.assertEqual(strict, general)
-                self.assertEqual(len(strict), 3)
-                self.assertNotIn(2, strict)
+                self.assertEqual(len(selected), 3)
+                self.assertNotIn(2, selected)
         signed = self.selector.select(self.points, self.weights, self.axis,
-            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
             **opts)
-        self.assertEqual(strict, signed)
-        with self.assertRaisesRegex(ValueError, "axes"):
-            self.selector.select(self.points, positive,
-                [self.axis, mp_isdf.AxisType.AtomicOrbitalGradX],
-                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
-                max_rank=3, space="host")
+        self.assertEqual(selected, signed)
+        # Quadrature works for AO plus derivative axes as well.
+        mixed = self.selector.select(self.points, positive,
+            [self.axis, mp_isdf.AxisType.AtomicOrbitalGradX],
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
+            max_rank=3, oversampling=4, seed=31, space="host")
+        self.assertEqual(len(mixed), 3)
+
+    def test_driver_technique_validation(self):
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
+        opts = dict(compute_metric=False, selection_only=True)
+        for technique in ("density", "density_col_norm"):
+            with self.subTest(technique=technique), self.assertRaisesRegex(NotImplementedError, "NYI"):
+                build_isdf(mol, anchor_algorithm="rand_sketch",
+                           sketch=technique, axes=("dx",), **opts)
+        for technique in ("feature", "ao_quadrature"):
+            with self.subTest(technique=technique), self.assertRaisesRegex(ValueError, "sketch"):
+                build_isdf(mol, anchor_algorithm="rand_sketch",
+                           sketch=technique, **opts)
+        with self.assertRaisesRegex(ValueError, "non-default sketch"):
+            build_isdf(mol, anchor_algorithm="qrcp_dense", sketch="density", **opts)
+        # The default quadrature technique need not be supplied.
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            build_isdf(mol, anchor_algorithm="rand_sketch", anchor_rank=2,
+                       anchor_tol=1e-6, **opts)
 
     def test_explicit_khatri_rao_identity(self):
         rng = np.random.default_rng(7)
@@ -107,7 +121,7 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
     def test_driver_rank_tolerance_are_exclusive(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            build_isdf(mol, anchor_algorithm="rand_feature_kr", anchor_rank=2,
+            build_isdf(mol, anchor_algorithm="rand_sketch", anchor_rank=2,
                        anchor_tol=1e-6, compute_metric=False, selection_only=True)
 
     def test_driver_absolute_quadrature_weights(self):
@@ -122,8 +136,8 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
 
         output = io.StringIO()
         with patch.object(dft.gen_grid, "Grids", PositiveGrids), redirect_stdout(output):
-            result = build_isdf(mol, anchor_algorithm="rand_ao_kr_quadrature",
-                                anchor_rank=2, anchor_oversampling=3,
+            result = build_isdf(mol, anchor_algorithm="rand_sketch",
+                                sketch="quadrature", anchor_rank=2, anchor_oversampling=3,
                                 compute_metric=False, selection_only=True, space="host",
                                 report_dimensions=True)
         self.assertIn("AOs=", output.getvalue())
@@ -133,15 +147,11 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
         raw_grid.level = 0
         raw_grid.build()
         if np.any(raw_grid.weights < 0):
-            signed_result = build_isdf(mol, anchor_algorithm="rand_ao_kr_quadrature",
-                                       anchor_rank=2, anchor_oversampling=3,
+            signed_result = build_isdf(mol, anchor_algorithm="rand_sketch",
+                                       sketch="quadrature", anchor_rank=2, anchor_oversampling=3,
                                        compute_metric=False, selection_only=True,
                                        space="host")
             self.assertEqual(len(signed_result["anchor_indices"]), 2)
-        feature = build_isdf(mol, anchor_algorithm="rand_feature_kr",
-                             anchor_rank=2, anchor_oversampling=3,
-                             compute_metric=False, selection_only=True, space="host")
-        self.assertEqual(len(feature["anchor_indices"]), 2)
         self.assertEqual(len(result["anchor_indices"]), 2)
         self.assertTrue(np.all(result["anchor_weights"] > 0))
 
@@ -154,14 +164,14 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
         for space in (("host", "device") if mp_isdf.cuda_enabled else ("host",)):
             result = self.selector.select(
                 self.points, self.weights, axes,
-                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
                 space=space, **opts)
             self.assertEqual(len(result), 3)
             self.assertEqual(len(set(result)), 3)
             self.assertNotIn(2, result)
             other_batch = self.selector.select(
                 self.points, self.weights, axes,
-                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+                algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
                 space=space, **(opts | {"batch_size": 5}))
             self.assertEqual(result, other_batch)
 
@@ -170,7 +180,7 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
         # Explicit rank determines sketch rows independently of sketch_size.
         explicit = self.selector.select(
             self.points, self.weights, self.axis,
-            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
             sketch_size=2, oversampling=3, max_rank=3, seed=31, space="host")
         self.assertEqual(explicit, self.select(space="host", max_rank=3))
         for kw in ({"batch_size": 0}, {"oversampling": 0}):
@@ -178,14 +188,14 @@ class TestRandomizedAnchorSelection(unittest.TestCase):
             if "oversampling" in opts:
                 with self.assertRaises(ValueError):
                     self.selector.select(self.points, self.weights, self.axis,
-                        algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+                        algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
                         sketch_size=12, **opts)
             else:
                 with self.assertRaises(ValueError):
                     self.select(space="host", **opts)
         self.assertEqual(self.selector.select(
             self.points, np.zeros_like(self.weights), self.axis,
-            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
             sketch_size=12, oversampling=3, space="host"), [])
         if not mp_isdf.cuda_enabled:
             with self.assertRaises(ValueError):

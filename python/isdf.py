@@ -2,7 +2,7 @@
 """Minimal grid ISDF demo adapted from ../isdf/isdf.py.
 
 PySCF builds the molecular grid; mp_isdf evaluates AOs and selects anchors
-with local QRCP (MAGMA on device, LAPACK++ on host). The default ISDF fit remains in NumPy; rbrp-id instead reuses its RBRP ID.
+with local QRCP (MAGMA on device, LAPACK++ on host). The default ISDF fit remains in NumPy; rbrp_id instead reuses its RBRP ID.
 The Coulomb metric uses integral-direct AO-pair Cholesky in C++.
 Derivative targets are spatial electronic-coordinate AO derivatives (not
 nuclear gradients or assembled four-component spinor integrals).
@@ -25,8 +25,15 @@ sys.path.insert(0, os.environ.get("ISDF_BUILD_DIR", str(Path(__file__).resolve()
 import mp_isdf
 
 
-DENSITY_SKETCHES = ("rand_ao_kr_density", "rand_ao_kr_density_normalized")
-SKETCH_ALGORITHMS = ("rand_feature_kr", "rand_ao_kr_quadrature", *DENSITY_SKETCHES)
+# One Khatri--Rao selection algorithm, with a choice of input/weighting policy.
+KHATRIRAO_SKETCH_TECHNIQUES = ("quadrature", "density", "density_col_norm")
+DENSITY_SKETCHES = ("density", "density_col_norm")
+SKETCH_ALGORITHMS = ("rand_sketch",)
+KHATRIRAO_BACKENDS = {
+    "quadrature": "RandomizedQuadratureKhatriRao",
+    "density": "RandomizedAODensityKhatriRao",
+    "density_col_norm": "RandomizedAODensityNormalizedKhatriRao",
+}
 
 
 AXES = {
@@ -279,7 +286,8 @@ def _normalized_pair_error(ao, anchor_pairs, anchor_weights, theta, importance, 
 
 def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                axes=("ao",), axis_weights=None, compute_metric=True, space="auto",
-               anchor_algorithm="dense", anchor_batch_size=128, fit_batch_size=2048,
+               anchor_algorithm="qrcp_dense", sketch="quadrature",
+               anchor_batch_size=128, fit_batch_size=2048,
                anchor_sketch_size=128, anchor_oversampling=16,
                anchor_seed=7, anchor_audit=False,
                point_importance=None, density_weight="electron_density",
@@ -302,24 +310,28 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     A positive `anchor_rank` forces that many pivots for rand sketch selection;
     it cannot be combined with an explicit `anchor_tol`. With neither set,
     the default tolerance is 1e-10. `anchor_tol` is a relative
-    QR-diagonal/max-column cutoff for dense/online selection and a sketch
+    QR-diagonal/max-column cutoff for qrcp_dense/qrcp_online selection and a sketch
     Frobenius cutoff for rand sketch selection. Anchor indices are
     relative to the original, unpruned PySCF grid. `space` selects where AO
     evaluation and QRCP run (auto, host, device); the NumPy fit stays on host.
-    `anchor_algorithm` is `dense` (default), `online` (direct multipass QRCP),
-    `rbrp` (host AO-only residual block sampling followed by the usual NumPy
-    fit), `rbrp-id` (same anchors with Algorithm 5.1 ID coefficients instead
-    of the NumPy scalar fit), `rand_feature_kr` (Khatri-Rao sketch of concatenated features, signed
-    weights treated by absolute value), `rand_ao_kr_quadrature` (AO-only
-    Khatri-Rao sketch weighted by absolute quadrature weights), or `cvt`.
+    `anchor_algorithm` is `qrcp_dense` (default), `qrcp_online` (direct multipass QRCP),
+    `rbrp` (AO-only residual block sampling and the usual NumPy fit), `rbrp_id`
+    (same selection with Algorithm 5.1 ID coefficients), `rand_sketch`,
+    or `cvt`. The Khatri--Rao algorithm defaults to `sketch="quadrature"`:
+    `quadrature` sketches selected axis-feature pairs weighted by sqrt(abs(grid_weight));
+    `density` uses raw pair columns weighted by sqrt(point_importance);
+    `density_col_norm` additionally divides each pair column by its squared
+    feature norm. The density techniques currently support only axes=('ao',)
+    (other axes are not yet implemented). Non-default `sketch` is invalid for
+    other algorithms.
     CVT requires a positive `anchor_rank`; it ignores
     `anchor_tol` and `axes`, uses `anchor_seed`, `cvt_max_iter`, and `cvt_tol`,
     and uses either spin-summed RKS B3LYP electron density (default) or
     absolute quadrature weights as its importance vector, not their product.
     Zero quadrature-weight and zero-importance sites are excluded from
     clustering and snapping.
-    `rand_ao_kr_density` uses sqrt(m/ell) times raw AO pairs;
-    `rand_ao_kr_density_normalized` additionally divides each pair column by
+    `density` uses sqrt(m/ell) times raw AO pairs;
+    `density_col_norm` additionally divides each pair column by
     sum(ao**2). Both require axes=('ao',). `density_weight` chooses density alone
     (default) or abs(quadrature_weight)*density. `point_importance`, if supplied,
     is the complete m on the original grid and overrides importance generation
@@ -336,7 +348,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     is a cap). Only AO features are currently supported. space='device' uses
     bounded Kokkos CUDA AO evaluation and MAGMA QR/BLAS in a CUDA build;
     space='auto' uses the device backend in a CUDA build and host otherwise.
-    rbrp-id constructs both
+    rbrp_id constructs both
     scalar interpolation vectors and metric coefficients from the same
     SVD-stabilized small L1 factor, without the NumPy scalar fit.
     Rand sketch selection uses `anchor_tol` as sketch Frobenius
@@ -393,18 +405,24 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
         if len(axis_weights) != len(axis_types) or not all(
                 np.isfinite(w) and w > 0 for w in axis_weights):
             raise ValueError("axis_weights must contain one finite positive factor per axis")
-    sketch_algorithms = SKETCH_ALGORITHMS
-    density_sketch = anchor_algorithm in DENSITY_SKETCHES
+    sketch_algorithm = anchor_algorithm == "rand_sketch"
+    if sketch_algorithm:
+        if sketch not in KHATRIRAO_SKETCH_TECHNIQUES:
+            raise ValueError(f"sketch must be one of {KHATRIRAO_SKETCH_TECHNIQUES} "
+                             "for rand_sketch")
+    elif sketch != "quadrature":
+        raise ValueError("non-default sketch requires anchor_algorithm='rand_sketch'")
+    density_sketch = sketch_algorithm and sketch in DENSITY_SKETCHES
     if density_sketch and axis_types != [mp_isdf.AxisType.AtomicOrbital]:
-        raise ValueError("density sketches require axes=('ao',)")
+        raise NotImplementedError("density Khatri--Rao sketches with non-AO axis features are NYI")
     if density_weight not in ("electron_density", "quadrature_density"):
         raise ValueError("density_weight must be electron_density or quadrature_density")
     if not np.isfinite(ao_screening_threshold) or ao_screening_threshold < 0:
         raise ValueError("ao_screening_threshold must be finite and nonnegative")
     if point_importance is not None and not (density_sketch or anchor_algorithm == "cvt"):
         raise ValueError("point_importance requires CVT or a density sketch")
-    rbrp_mode = anchor_algorithm in ("rbrp", "rbrp-id")
-    if anchor_algorithm not in ("dense", "online", "cvt", "rbrp", "rbrp-id", *sketch_algorithms):
+    rbrp_mode = anchor_algorithm in ("rbrp", "rbrp_id")
+    if anchor_algorithm not in ("qrcp_dense", "qrcp_online", "cvt", "rbrp", "rbrp_id", *SKETCH_ALGORITHMS):
         raise ValueError(f"unknown anchor algorithm: {anchor_algorithm!r}")
     if rbrp_mode:
         if axis_types != [mp_isdf.AxisType.AtomicOrbital]:
@@ -435,12 +453,12 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     if (not isinstance(anchor_sketch_size, (int, np.integer)) or
         not isinstance(anchor_oversampling, (int, np.integer)) or
         anchor_oversampling < 1 or anchor_sketch_size < 1 or
-        (anchor_algorithm in sketch_algorithms and anchor_rank == 0 and
+        (sketch_algorithm and anchor_rank == 0 and
          anchor_sketch_size <= anchor_oversampling)):
         raise ValueError("randomized anchor sketch_size must exceed oversampling when anchor_rank=0")
     if not isinstance(anchor_seed, (int, np.integer)) or not 0 <= anchor_seed < 2**64:
         raise ValueError("anchor_seed must be an unsigned 64-bit integer")
-    if anchor_audit and anchor_algorithm not in sketch_algorithms:
+    if anchor_audit and not sketch_algorithm:
         raise ValueError("anchor_audit requires a rand sketch algorithm")
     if metric_algorithm not in ("grid", "unblocked_greedy", "unblocked_uniform"):
         raise ValueError(f"unknown metric algorithm: {metric_algorithm!r}")
@@ -501,7 +519,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
             f"symmetric_pair_rank_ceiling={pair_rank_ceiling} "
             f"grid_points={len(all_coords)} nonzero_weight_points={int(np.count_nonzero(keep))}"
         )
-        if anchor_algorithm in sketch_algorithms:
+        if sketch_algorithm:
             ell = (anchor_rank + anchor_oversampling
                    if anchor_rank > 0 else anchor_sketch_size)
             sketch_cap = min(ell - anchor_oversampling, pair_rank_ceiling,
@@ -520,18 +538,15 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                 dimensions += " (anchor_sketch_size ignored)"
         print(dimensions, flush=True)
     anchor_choices = {
-        "dense": "QRColumnPivoting",
-        "online": "OnlineQRColumnPivoting",
-        "rand_feature_kr": "RandomizedFeatureKhatriRao",
-        "rand_ao_kr_quadrature": "RandomizedAOQuadratureKhatriRao",
-        "rand_ao_kr_density": "RandomizedAODensityKhatriRao",
-        "rand_ao_kr_density_normalized": "RandomizedAODensityNormalizedKhatriRao",
+        "qrcp_dense": "QRColumnPivoting",
+        "qrcp_online": "OnlineQRColumnPivoting",
         "cvt": "CentroidalVoronoi",
     }
     if not rbrp_mode:
         try:
             anchor_choice = getattr(mp_isdf.LocalAnchorSelectionAlgorithm,
-                                    anchor_choices[anchor_algorithm])
+                                    (KHATRIRAO_BACKENDS[sketch] if sketch_algorithm
+                                     else anchor_choices[anchor_algorithm]))
         except AttributeError as exc:
             raise RuntimeError("rebuild the mp_isdf extension to use this anchor algorithm") from exc
     cvt_weights = None
@@ -553,7 +568,7 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
                         tolerance=anchor_tol, max_rank=anchor_rank, seed=anchor_seed,
                         tau_block=rbrp_tau_block, rank_rtol=rbrp_rank_rtol,
                         refresh_every=rbrp_refresh_every, svd_rtol=rbrp_svd_rtol,
-                        compute_id=(anchor_algorithm == "rbrp-id" and not selection_only))
+                        compute_id=(anchor_algorithm == "rbrp_id" and not selection_only))
         device_backend = getattr(mp_isdf, "rbrp_ao_device", None)
         if space == "device" and device_backend is None:
             raise ValueError("RBRP device selection requires a CUDA build")
@@ -624,14 +639,14 @@ def build_isdf(mol, mf=None, *, level=0, anchor_rank=0, anchor_tol=None,
     anchor_pairs = (anchor_ao[:, :, None] * anchor_ao[:, None, :]).reshape(rank, nao * nao)
     id_info = None
     fit_diagnostics = None
-    if anchor_algorithm == "rbrp-id":
+    if anchor_algorithm == "rbrp_id":
         # Algorithm 5.1: reuse L and Q; no NumPy AO-pair Gram fit.
         interp_vecs = rbrp_result["interp_vecs"]
         transform = rbrp_result["transform"]
         id_info = {key: rbrp_result[key] for key in
                    ("retained_rank", "condition", "relative_residual", "status")}
         if debug:
-            print(f"[rbrp-id] {id_info}", flush=True)
+            print(f"[rbrp_id] {id_info}", flush=True)
     else:
         interp_vecs, transform, fit_diagnostics = _physical_pair_refit(
             anchor_pairs, anchor_weights, ao, fit_batch_size)
@@ -817,8 +832,11 @@ def main():
     parser.add_argument("--anchor-tol", type=float, default=None,
                         help="stop at this relative QR/sketch residual tolerance (default: 1e-10 if rank omitted)")
     parser.add_argument("--anchor-algorithm",
-                        choices=("dense", "online", *SKETCH_ALGORITHMS, "cvt", "rbrp", "rbrp-id"),
-                        default="dense", help="rbrp selects anchors and uses the existing fit; rbrp-id uses Algorithm 5.1 ID coefficients")
+                        choices=("qrcp_dense", "qrcp_online", *SKETCH_ALGORITHMS, "cvt", "rbrp", "rbrp_id"),
+                        default="qrcp_dense", help="rbrp selects anchors and uses the existing fit; rbrp_id uses Algorithm 5.1 ID coefficients")
+    parser.add_argument("--sketch", choices=KHATRIRAO_SKETCH_TECHNIQUES, default=None,
+                        help="rand_sketch technique (default: quadrature); "
+                             "density techniques with non-AO axes are NYI")
     parser.add_argument("--rbrp-block-size", type=int, default=16)
     parser.add_argument("--rbrp-tau-block", type=float, default=None,
                         help="local QR trailing-energy threshold (default: 1/block_size)")
@@ -826,7 +844,7 @@ def main():
     parser.add_argument("--rbrp-refresh-every", type=int, default=8)
     parser.add_argument("--rbrp-svd-rtol", type=float, default=1e-12)
     parser.add_argument("--anchor-batch-size", type=int, default=128,
-                        help="grid points per AO batch for online or rand sketch anchor selection")
+                        help="grid points per AO batch for qrcp_online or rand sketch anchor selection")
     parser.add_argument("--fit-batch-size", type=int, default=2048,
                         help="grid points per interpolation-vector fit batch")
     parser.add_argument("--anchor-sketch-size", type=int, default=128,
@@ -879,6 +897,8 @@ def main():
         parser.error("--anchor-rank must be nonnegative")
     if args.anchor_algorithm == "cvt" and args.anchor_rank == 0:
         parser.error("--anchor-algorithm cvt requires --anchor-rank > 0")
+    if args.anchor_algorithm not in SKETCH_ALGORITHMS and args.sketch is not None:
+        parser.error("--sketch requires --anchor-algorithm rand_sketch")
     if args.cvt_max_iter < 1 or not np.isfinite(args.cvt_tol) or args.cvt_tol < 0:
         parser.error("--cvt-max-iter must be positive and --cvt-tol finite and nonnegative")
     if args.anchor_batch_size <= 0:
@@ -938,6 +958,7 @@ def main():
                         anchor_tol=args.anchor_tol, axes=axes,
                         axis_weights=axis_weights, compute_metric=not args.no_metric, space=args.space,
                         anchor_algorithm=args.anchor_algorithm,
+                        sketch=args.sketch or "quadrature",
                         anchor_batch_size=args.anchor_batch_size,
                         fit_batch_size=args.fit_batch_size,
                         anchor_sketch_size=args.anchor_sketch_size,

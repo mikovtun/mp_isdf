@@ -160,7 +160,7 @@ class TestAnchorSelection(unittest.TestCase):
                                  mo_coeff=np.ones((2, 1)), nocc=1)
         randomized = self.selector.select(
             self.points, self.weights, mp_isdf.AxisType.AtomicOrbital,
-            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedFeatureKhatriRao,
+            algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
             sketch_size=12, oversampling=3, max_rank=2, seed=7)
         self.assertEqual(len(randomized), 2)
         self.assertEqual(len(set(randomized)), 2)

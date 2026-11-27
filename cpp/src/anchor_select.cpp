@@ -94,7 +94,7 @@ std::vector<std::size_t> AnchorSelection::select(
         algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao ||
         algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao;
     if (density_sketch && (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
-        throw std::invalid_argument("density Khatri-Rao sketch requires axes=(ao,)");
+        throw std::invalid_argument("density Khatri-Rao sketches with non-AO axis features are NYI");
     if (!axis_weights.empty() && axis_weights.size() != axes.size())
         throw std::invalid_argument("axis weights must match axes");
     for (double weight : axis_weights)
@@ -152,8 +152,7 @@ std::vector<std::size_t> AnchorSelection::select(
     case LocalAnchorSelectionAlgorithm::OnlineQRColumnPivoting:
         return OnlineQRAnchorSelection::select(*this, points, weights, axes, tolerance,
                                                max_rank, mo_coeff, nocc, space, batch_size, debug, scales);
-    case LocalAnchorSelectionAlgorithm::RandomizedFeatureKhatriRao:
-    case LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao:
+    case LocalAnchorSelectionAlgorithm::RandomizedQuadratureKhatriRao:
     case LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao:
     case LocalAnchorSelectionAlgorithm::RandomizedAODensityNormalizedKhatriRao:
         return RandomizedIDAnchorSelection::select(*this, points, weights, axes, tolerance,
@@ -163,8 +162,7 @@ std::vector<std::size_t> AnchorSelection::select(
                 ? SketchPolicy::AODensityNormalized
                 : algorithm == LocalAnchorSelectionAlgorithm::RandomizedAODensityKhatriRao
                 ? SketchPolicy::AODensity
-                : algorithm == LocalAnchorSelectionAlgorithm::RandomizedAOQuadratureKhatriRao
-                ? SketchPolicy::AOQuadrature : SketchPolicy::FeatureQuadrature,
+                : SketchPolicy::Quadrature,
             scales, point_importance, ao_screening_threshold);
     case LocalAnchorSelectionAlgorithm::CentroidalVoronoi:
         return CVTAnchorSelection::select(points, weights, cvt_weights, max_rank,

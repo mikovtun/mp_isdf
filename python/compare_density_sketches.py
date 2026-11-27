@@ -39,7 +39,9 @@ def compare(mol, *, rank, level=0, oversampling=16, seeds=(7, 11, 23),
             for seed in seeds:
                 result = build_isdf(
                     mol, level=level, grid=grid, point_importance=importance,
-                    anchor_algorithm=algorithm, anchor_rank=rank,
+                    anchor_algorithm=("cvt" if algorithm == "cvt" else "rand_sketch"),
+                    sketch=None if algorithm == "cvt" else algorithm,
+                    anchor_rank=rank,
                     anchor_oversampling=oversampling, anchor_seed=seed,
                     ao_screening_threshold=threshold, density_weight=convention,
                     metric_algorithm=metric, space=space, pair_space_error=True)

@@ -23,8 +23,7 @@ enum class DistributedAnchorSelectionAlgorithm {
 enum class LocalAnchorSelectionAlgorithm {
   QRColumnPivoting,
   OnlineQRColumnPivoting,
-  RandomizedFeatureKhatriRao,
-  RandomizedAOQuadratureKhatriRao,
+  RandomizedQuadratureKhatriRao,
   CentroidalVoronoi,
   RandomizedAODensityKhatriRao,
   RandomizedAODensityNormalizedKhatriRao

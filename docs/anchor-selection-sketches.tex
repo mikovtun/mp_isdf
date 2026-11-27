@@ -1,0 +1,168 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=21mm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,array,longtable,xcolor,hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\setlength{\parskip}{5pt}
+\setlength{\parindent}{0pt}
+\newcommand{\code}[1]{\texttt{#1}}
+\title{Anchor Selection in \texttt{mp\_isdf}\\\large Which Algorithms Change the Sketch?}
+\author{Codebase guide \quad (\texttt{cpp/src/anchor\_select*.cpp}, \texttt{python/isdf.py})}
+\date{Generated from the current source tree}
+\begin{document}
+\maketitle
+\begin{abstract}
+Anchor indices are grid sites. This guide groups every selector exposed by
+\code{python/isdf.py} by its actual sketch matrix, rather than by whether it
+uses randomness. In particular, randomized candidate sampling and randomized
+initialization are \emph{not} Gaussian sketching. A new weighting or
+normalization changes the matrix being sketched, but does not automatically
+constitute a new random embedding distribution.
+\end{abstract}
+
+\section{Notation and decision map}
+Let $g=1,\ldots,n$ index eligible grid sites, $w_g$ be the signed quadrature
+weight, $a_g\in\mathbb R^d$ the AO-value vector, and $f_g\in\mathbb R^d$
+the requested concatenated and scaled feature vector (AO, derivative, or
+occupied-orbital channels). In the general-feature mode, each axis channel
+is normalized by its Frobenius norm over eligible sites and may receive an
+axis weight. Let $p_g=a_g\otimes a_g$ be the ordered AO-pair column and
+$q_g=\|a_g\|_2^2$, so $\|p_g\|_2=q_g$. The sketch has $\ell$ rows and
+$n$ columns; $u_t,v_t$ are independent standard Gaussian $d$-vectors, shared
+across grid batches. All the Khatri--Rao modes use the \emph{same} factorized
+Gaussian map $S_{t,(\mu,\nu)}=u_{t\mu}v_{t\nu}/\sqrt\ell$ and apply QR with
+column pivoting (QRCP) to its sketched columns. They do not form the full
+ordered pair matrix. Differences below concern $f_g$, column weights, and
+normalization, not the random map itself.
+
+\small
+\begin{longtable}{@{}p{0.28\linewidth}p{0.29\linewidth}p{0.34\linewidth}@{}}
+\toprule
+CLI selector / technique & Sketch / random mechanism & What changes? \\
+\midrule\endhead
+\code{qrcp\_dense} & None: QRCP of full weighted feature pairs & Baseline, direct deterministic selection. \\
+\code{qrcp\_online} & None: implicit full weighted feature pairs & Algorithmic, bounded-memory multipass direct QR selection; no new embedding. \\
+\code{quadrature} & Gaussian Khatri--Rao pair sketch & Any selected axes; quadrature-weighted pairs. \\
+\code{density} & Same Gaussian Khatri--Rao map & Replace quadrature column weight with importance; non-AO axes NYI. \\
+\code{density\_col\_norm} & Same Gaussian Khatri--Rao map & Importance plus pair-column normalization; non-AO axes NYI. \\
+\code{rbrp} & No Gaussian sketch; residual-weighted candidate sampling & Different randomized \emph{selection algorithm} on AO pairs. \\
+\code{rbrp\_id} & Same candidate sampling as \code{rbrp} & Same selection family; additionally changes interpolation/fit via ID. \\
+\code{cvt} & No pair sketch; weighted $k$-means++ initialization & Different spatial objective, not random matrix sketching. \\
+\bottomrule
+\end{longtable}
+\normalsize
+The three technique rows above use
+\code{--anchor-algorithm rand\_sketch}, optionally with
+\code{--sketch TECHNIQUE} (default: \code{quadrature}). An explicit sketch
+option is invalid for other algorithms. \code{rbrp\_id} is a separate anchor algorithm.
+
+\section{Family A: one factored Gaussian pair map, three inputs}
+The implemented sketch entries have the unified form
+\begin{equation}
+Y_{tg}=\sqrt{\frac{h_g}{\ell}}\,
+ (u_t^\mathsf T z_g)(v_t^\mathsf T z_g),
+\qquad z_g=f_g\ \text{or}\ a_g/\sqrt{q_g}.
+\label{eq:family}
+\end{equation}
+Equivalently, $Y=S X$ with columns $X_g=\sqrt{h_g}\,(z_g\otimes z_g)$.
+Note that $u_t$ and $v_t$ are independent; these are \emph{not} two copies
+of the same Gaussian vector. Code generates the factors from two independent
+seeded streams. The normalized variant computes the quotient using
+$a_g/\sqrt{q_g}$ before projection (algebraically $p_g/q_g$).
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.37\linewidth}p{0.16\linewidth}p{0.33\linewidth}@{}}
+\toprule
+Sketch technique & $h_g$ & $z_g$ and interpretation \\
+\midrule
+\code{quadrature} & $|w_g|$ & $f_g$: requested axes, scaled if multiple; AO-only uses raw AO pairs. \\
+\code{density} & $m_g$ & $a_g$: raw AO-pair amplitude retained (other axes NYI). \\
+\code{density\_col\_norm} & $m_g$ & $a_g/\sqrt{q_g}$: removes pair-column amplitude (other axes NYI). \\
+\bottomrule
+\end{tabular}
+\end{center}
+For density modes $m_g$ defaults to spin-summed electron density from a
+separate converged RKS B3LYP calculation (\code{density\_weight=electron\_density}).
+\code{quadrature\_density} instead sets $m_g=|w_g|\rho_g$; the caller may
+supply a complete nonnegative \code{point\_importance} array. There is
+\emph{no additional} quadrature factor in either density mode. They require
+\code{axes=ao}; zero-weight and zero-importance sites are excluded and sites
+with $q_g\leq$ \code{ao\_screening\_threshold} are screened from the density
+selection (not from the eventual physical refit). The normalized mode has
+$\|X_g\|_2^2=m_g$ because $\|p_g\|=q_g$; raw density instead has
+$\|X_g\|_2^2=m_gq_g^2$. This is the meaningful change in its selection
+criterion. It is \emph{not} a replacement of the Gaussian Khatri--Rao sketch
+by a new sketch distribution, nor a claim of better J/K accuracy.
+
+The three implementations are policies in
+\code{cpp/src/anchor\_select\_randomized\_id.cpp}; the general feature
+normalization is computed in \code{cpp/src/anchor\_select.cpp}. All three
+store $Y\in\mathbb R^{\ell\times n}$, run QRCP on $Y$, and return pivot
+\emph{indices only}; they do not currently use the sketch QR factors to fit
+interpolation vectors. With explicit rank $k$, $\ell=k+$ oversampling and
+$k$ pivots are required if eligible and numerically possible; otherwise
+\code{anchor\_sketch\_size} supplies $\ell$, and stopping uses a relative
+\emph{sketch} Frobenius-tail tolerance. These tails are not physical pair-space
+or Coulomb error guarantees. \code{anchor\_audit} compares physical pair
+projection errors to direct QRCP only on small problems.
+
+\section{Family B: random selection without a random sketch matrix}
+\textbf{\code{rbrp}, \code{rbrp\_id}.} For AO-only selection, stream symmetric
+pair rows
+$X_{g,(\mu,\nu)}=\sqrt{|w_g|}a_{g\mu}a_{g\nu}$ with a factor $\sqrt2$
+on off-diagonals. This preserves the norm of the ordered-pair representation
+without storing duplicate off-diagonal entries. At each iteration, sample a
+block of distinct candidate sites with probabilities proportional to their
+current squared pair-space residuals; project against the retained subspace,
+then run QRCP on the small block and update/refine the residual estimates.
+This is an \emph{adaptive residual-weighted sampling algorithm}, not
+$S X$ with a fixed Gaussian $S$. The default \code{rbrp} hands the selected
+anchors to the usual physical-grid NumPy interpolation fit. \code{rbrp\_id}
+selects anchors by the same procedure but constructs ID coefficients and a
+pair transform from its factorization (with SVD truncation); that is a
+\emph{fit change}, not a new sketch. CPU implementation:
+\code{cpp/src/anchor\_select\_rbrp.cpp}; CUDA variant:
+\code{cpp/src/anchor\_select\_rbrp\_device.cpp}. Its rank is a cap and the
+stopping residual is a physical weighted pair-space projection residual.
+
+\textbf{\code{cvt}.} Importance-weighted centroidal Voronoi clustering uses
+random weighted $k$-means++ initialization, minimizes a spatial squared-distance
+objective, and snaps centroids to distinct eligible grid sites. Default
+importance is density; \code{cvt\_weight=quadrature\_weights} uses $|w_g|$
+\emph{instead}, not multiplied by density. It needs a positive rank; QR/sketch
+tolerances do not apply. This is a spatial clustering algorithm rather than
+pair-space sketching or randomized linear algebra. Implementation:
+\code{cpp/src/anchor\_select\_cvt.cpp}.
+
+\section{Family C: deterministic, unsketched pair selection}
+\textbf{\code{qrcp\_dense}.} Build $A_g=\sqrt{|w_g|}(f_g\otimes f_g)$ as columns of
+an explicit $d^2\times n$ matrix and select grid pivots with LAPACK++ QRCP on
+host or MAGMA QRCP on device. A rank is a cap; tolerance compares the QR
+diagonal against its first entry. This is the reference selector but its pair
+matrix requires $O(d^2n)$ storage. Implementation:
+\code{cpp/src/anchor\_select\_qrcp.cpp}.
+
+\textbf{\code{qrcp\_online}.} Evaluate the same feature-pair columns in bounded
+batches, incrementally maintaining Householder reflectors and residual norms,
+with candidate verification and refreshes. It changes the \emph{execution
+algorithm and memory behavior}, not the pair objective and not the random
+embedding (there is none). Near pivot ties or numerical thresholds its pivots
+need not match dense QR bit for bit. Implementation:
+\code{cpp/src/anchor\_select\_online\_qr.cpp}.
+
+\section{Interpreting comparisons}
+Changing $|w_g|$ to $m_g$, normalizing $p_g$ by $q_g$, or changing $f_g$ to
+$a_g$ changes the \emph{input/objective} seen by QRCP. Moving from dense to
+online changes the \emph{algorithm for approximately the same direct
+selection task}. Moving to RBRP changes the \emph{randomized selection
+mechanism} without defining a Gaussian sketch. Moving to CVT changes the
+\emph{objective space} from orbital pairs to real-space geometry. Only
+\code{rbrp\_id} replaces the usual post-selection interpolation fit.
+
+For fair comparisons, fix the grid, eligible sites, rank, and relevant
+importance convention; use several seeds for randomized methods and inspect
+pair-space residuals and downstream J/K accuracy independently. Signed grid
+weights enter selection through absolute values; the downstream physical fit
+is separate. For usage and caveats see the repository's anchor-selection guide
+and README.
+\end{document}

@@ -89,7 +89,7 @@ class TestDensitySketch(unittest.TestCase):
         mass[self.weights == 0] = 0
         old = self.selector.select(
             self.points, mass, self.axis, max_rank=1, oversampling=3, seed=31,
-            space="host", algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao)
+            space="host", algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao)
         self.assertEqual(self.select(False), old)
 
     def test_multi_ao_matches_independent_legacy_scaling(self):
@@ -110,7 +110,7 @@ class TestDensitySketch(unittest.TestCase):
                 opts = dict(max_rank=2, oversampling=4, seed=seed, space=space)
                 reference = selector.select(
                     points, reference_weights, self.axis, batch_size=3,
-                    algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedAOQuadratureKhatriRao,
+                    algorithm=mp_isdf.LocalAnchorSelectionAlgorithm.RandomizedQuadratureKhatriRao,
                     **opts)
                 for batch_size in (1, 11):
                     actual = selector.select(
@@ -173,7 +173,9 @@ class TestDensitySketch(unittest.TestCase):
         importance[::2] = 0
         for algorithm in ("cvt", *DENSITY_SKETCHES):
             with self.subTest(algorithm=algorithm):
-                result = build_isdf(mol, grid=grid, anchor_algorithm=algorithm,
+                result = build_isdf(mol, grid=grid,
+                                    anchor_algorithm=("cvt" if algorithm == "cvt" else "rand_sketch"),
+                                    sketch=None if algorithm == "cvt" else algorithm,
                                     point_importance=importance, anchor_rank=2,
                                     anchor_oversampling=3, compute_metric=False,
                                     pair_space_error=True, space="host")
@@ -183,8 +185,8 @@ class TestDensitySketch(unittest.TestCase):
                 self.assertIn("density_normalized", result["pair_space_errors"])
                 self.assertIsNotNone(result["fit_diagnostics"])
         with patch("isdf.prepare_point_importance", return_value=importance) as prepare:
-            result = build_isdf(mol, grid=grid, anchor_algorithm=DENSITY_SKETCHES[1],
-                                anchor_rank=2, compute_metric=False, selection_only=True,
+            result = build_isdf(mol, grid=grid, anchor_algorithm="rand_sketch",
+                                sketch=DENSITY_SKETCHES[1], anchor_rank=2, compute_metric=False, selection_only=True,
                                 density_weight="quadrature_density", space="host")
             self.assertEqual(prepare.call_args.kwargs["convention"], "quadrature_density")
             np.testing.assert_array_equal(result["point_importance"], importance)

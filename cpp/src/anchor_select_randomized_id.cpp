@@ -111,9 +111,8 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select(
         if (!std::isfinite(ao_screening_threshold) || ao_screening_threshold < 0)
             throw std::invalid_argument("AO screening threshold must be finite and nonnegative");
     }
-    if (policy != SketchPolicy::FeatureQuadrature &&
-        (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
-        throw std::invalid_argument("AO Khatri-Rao sketch requires axes=(ao,)");
+    if (density && (axes.size() != 1 || axes[0] != AxisType::AtomicOrbital))
+        throw std::invalid_argument("density Khatri-Rao sketches with non-AO axis features are NYI");
     if (points.size() != weights.size() || !std::isfinite(tolerance) || tolerance < 0 ||
         batch_size == 0 || oversampling == 0 ||
         (!max_rank && sketch_size <= oversampling))
@@ -374,8 +373,9 @@ std::vector<std::size_t> RandomizedIDAnchorSelection::select_in_space(
         selected.push_back(original[static_cast<std::size_t>(jpvt[i]-1)]);
     }
     if (debug) {
-        std::cerr << (normalized ? "[rand_ao_kr_density_normalized]" : density ? "[rand_ao_kr_density]"
-                      : policy == SketchPolicy::AOQuadrature ? "[rand_ao_kr_quadrature]" : "[rand_feature_kr]")
+        std::cerr << (normalized ? "[rand_sketch:density_col_norm]"
+                                 : density ? "[rand_sketch:density]"
+                                           : "[rand_sketch:quadrature]")
                   << " rank=" << rank << " sketch_size=" << ell
                   << " oversampling=" << oversampling << " columns=" << n
                   << " sketch_relative_frobenius=" << (norm ? tails[rank]/norm : 0)

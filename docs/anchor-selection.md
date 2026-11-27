@@ -13,11 +13,11 @@ python python/isdf.py --anchor-algorithm ALGORITHM --anchor-rank N
 In Python, use the same name with `build_isdf`:
 
 ```python
-result = build_isdf(mol, anchor_algorithm="online", anchor_rank=40)
+result = build_isdf(mol, anchor_algorithm="qrcp_online", anchor_rank=40)
 ```
 
 The selected anchors are locations on the molecular integration grid. All
-methods ultimately use the ordinary physical-grid fit except `rbrp-id`, which
+methods ultimately use the ordinary physical-grid fit except `rbrp_id`, which
 uses its own interpolation-ID fit. Unless noted otherwise, `--anchor-rank N`
 requests/caps the number of anchors and `--axes ao` is the default selection
 feature. Rank and `--anchor-tol` cannot be supplied together.
@@ -26,14 +26,13 @@ feature. Rank and `--anchor-tol` cannot be supplied together.
 
 | If you want… | Try… |
 |---|---|
-| A general-purpose deterministic baseline | `dense` |
-| Less selection memory on a large grid, with a possible runtime tradeoff | `online` |
-| Randomized selection based on selected orbital features | `rand_feature_kr` |
-| Randomized AO-pair selection emphasizing quadrature-weighted pair magnitude | `rand_ao_kr_quadrature` |
-| AO-pair selection guided by density importance | `rand_ao_kr_density_normalized` |
+| A general-purpose deterministic baseline | `qrcp_dense` |
+| Less selection memory on a large grid, with a possible runtime tradeoff | `qrcp_online` |
+| Randomized quadrature-weighted selection on chosen axes | `rand_sketch` (default sketch: `quadrature`) |
+| AO-pair selection guided by density importance (other axes NYI) | `rand_sketch`, `--sketch density_col_norm` |
 | A spatially distributed, density- or weight-guided set | `cvt` |
 | Blockwise randomized AO-only selection | `rbrp` |
-| Blockwise randomized selection with its associated interpolation ID | `rbrp-id` |
+| Blockwise randomized selection with its associated interpolation ID | `rbrp_id` |
 
 Anchor quality is not itself a guarantee of J/K or energy accuracy. Compare
 methods at equal anchor counts using `--compare` (or the companion comparison
@@ -42,7 +41,14 @@ scripts), and include the physical pair residual where useful with
 
 ## Algorithms
 
-### `dense` — pivoted QR (default)
+The three Khatri--Rao techniques use one `rand_sketch` algorithm.
+Select its input/weighting policy with `--sketch` (or `sketch=` in
+`build_isdf`); the default is `quadrature`. An explicit `--sketch` option is
+invalid for other algorithms.
+`quadrature` supports all axis features. `density` and `density_col_norm`
+currently accept only `--axes ao`; other axis features raise a NYI error.
+
+### `qrcp_dense` — pivoted QR (default)
 
 Selects grid points using direct, deterministic column-pivoted QR on the
 selected pair-product matrix. Use this as the straightforward reference method
@@ -50,29 +56,29 @@ when grid and pair dimensions are manageable. It can be used with the available
 `--axes` choices.
 
 ```sh
-python python/isdf.py --anchor-algorithm dense --anchor-rank 40
+python python/isdf.py --anchor-algorithm qrcp_dense --anchor-rank 40
 ```
 
-An explicit rank is a maximum rank for dense selection, not a promise that all
+An explicit rank is a maximum rank for qrcp_dense selection, not a promise that all
 requested pivots will be returned if the data have lower numerical rank. If no
 rank is supplied, the default QR tolerance is used.
 
-### `online` — bounded-batch pivoted QR
+### `qrcp_online` — bounded-batch pivoted QR
 
-Selects anchors with the same direct QR objective as `dense`, while processing
+Selects anchors with the same direct QR objective as `qrcp_dense`, while processing
 the grid in batches. It is an option when the full selection matrix is too large
 to hold at once. This approach can take longer because it revisits grid data;
 reduced memory does not imply reduced runtime. It supports the available
 `--axes` choices.
 
 ```sh
-python python/isdf.py --anchor-algorithm online --anchor-rank 40 \
+python python/isdf.py --anchor-algorithm qrcp_online --anchor-rank 40 \
   --anchor-batch-size 128
 ```
 
 Here the rank is a cap. With no rank, `--anchor-tol` controls stopping.
 
-### `rand_feature_kr` — randomized feature-pair sketch
+### `rand_sketch --sketch quadrature` — quadrature-weighted feature-pair sketch
 
 Uses a randomized sketch of the outer products of the requested orbital
 features. It is suitable when feature choices such as AO values, gradients, or
@@ -80,7 +86,7 @@ occupied orbitals should guide selection. Signed quadrature weights contribute
 through their absolute magnitudes.
 
 ```sh
-python python/isdf.py --anchor-algorithm rand_feature_kr --axes ao,occ \
+python python/isdf.py --anchor-algorithm rand_sketch --sketch quadrature --axes ao,occ \
   --anchor-rank 40 --anchor-oversampling 16 --anchor-seed 7
 ```
 
@@ -89,21 +95,11 @@ candidate and numerical-rank limits. Without a rank, `--anchor-tol` controls the
 sketch residual. The sketch size and oversampling are controlled by
 `--anchor-sketch-size`, `--anchor-oversampling`, and `--anchor-seed`.
 
-### `rand_ao_kr_quadrature` — quadrature-weighted AO-pair sketch
+With `--axes ao` this is the quadrature-weighted raw AO-pair sketch. Signed
+grids are handled via the absolute quadrature weights. Rank, tolerance, seed,
+and sketch-size controls apply to all three sketch techniques.
 
-A randomized AO-only selector that emphasizes pair columns according to the
-absolute quadrature weights. Use it when the selection objective should track
-the grid-weighted AO-pair magnitude. It requires `--axes ao` and supports
-signed grids by treating negative and positive quadrature weights by magnitude.
-
-```sh
-python python/isdf.py --anchor-algorithm rand_ao_kr_quadrature \
-  --anchor-rank 40 --anchor-oversampling 16
-```
-
-Rank, tolerance, seed, and sketch-size controls follow `rand_feature_kr`.
-
-### `rand_ao_kr_density` — raw density-weighted AO-pair sketch
+### `rand_sketch --sketch density` — raw density-weighted AO-pair sketch
 
 An AO-only randomized selector that uses electron-density importance while
 retaining the amplitudes of the AO-pair columns. It provides a useful control
@@ -114,15 +110,15 @@ alone is used, with no extra quadrature factor. Set
 absolute quadrature weight.
 
 ```sh
-python python/isdf.py --anchor-algorithm rand_ao_kr_density \
+python python/isdf.py --anchor-algorithm rand_sketch --sketch density \
   --anchor-rank 40 --anchor-oversampling 16
 ```
 
-Requires `--axes ao`. Rank and sketch controls follow the other randomized
-selectors. In the Python API, `point_importance=` can supply a complete,
+Currently requires `--axes ao` (other axis features are NYI). Rank and sketch
+controls follow the other randomized selectors. In the Python API, `point_importance=` can supply a complete,
 nonnegative importance array aligned with the original grid.
 
-### `rand_ao_kr_density_normalized` — normalized density-weighted AO-pair sketch
+### `rand_sketch --sketch density_col_norm` — normalized density-weighted AO-pair sketch
 
 The proposed density-guided selector. It weights each AO-pair direction by the
 square root of its point importance, but normalizes away the pair column's
@@ -133,7 +129,7 @@ method and not a guarantee of improved J/K accuracy.
 
 ```sh
 python python/isdf.py \
-  --anchor-algorithm rand_ao_kr_density_normalized --axes ao \
+  --anchor-algorithm rand_sketch --sketch density_col_norm --axes ao \
   --anchor-rank 40 --anchor-oversampling 16 \
   --density-weight electron_density \
   --ao-screening-threshold 1e-24
@@ -147,7 +143,7 @@ available to the physical refit. In `build_isdf`, a caller may pass a complete
 `point_importance` array instead of generating density internally. If comparing
 against CVT, use the same importance array for both.
 
-For both density sketch modes, an explicit rank requests exactly that many
+For both density sketch techniques, an explicit rank requests exactly that many
 pivots; a request exceeding the eligible or numerical rank fails. Without an
 explicit rank, `--anchor-tol` is a relative sketch Frobenius residual tolerance.
 Neither it nor the density-weighted normalized reconstruction residual is a
@@ -189,14 +185,14 @@ Requires `--axes ao`. Here `--anchor-rank` is a **cap**, not a promise of an
 exact number of pivots; without a rank, `--anchor-tol` controls the stopping
 criterion. `rbrp` uses the usual physical interpolation fit after selection.
 
-### `rbrp-id` — blockwise randomized selection and interpolation ID
+### `rbrp_id` — blockwise randomized selection and interpolation ID
 
 Uses the same AO-only blockwise randomized selection family as `rbrp`, and also
 constructs interpolation coefficients from its selected-subspace ID. Choose it
 when you want that ID-based fit instead of the usual NumPy physical refit.
 
 ```sh
-python python/isdf.py --anchor-algorithm rbrp-id --anchor-rank 40 \
+python python/isdf.py --anchor-algorithm rbrp_id --anchor-rank 40 \
   --rbrp-block-size 16 --anchor-seed 7
 ```
 

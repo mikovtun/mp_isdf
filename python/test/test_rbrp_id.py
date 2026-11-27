@@ -79,14 +79,14 @@ class TestRBRPID(unittest.TestCase):
         opts = dict(level=0, anchor_rank=2, anchor_seed=7, space="host",
                     pair_space_error=True)
         with patch("isdf.np.linalg.pinv", side_effect=AssertionError("NumPy fit used")):
-            fit_id = build_isdf(mol, anchor_algorithm="rbrp-id", **opts)
+            fit_id = build_isdf(mol, anchor_algorithm="rbrp_id", **opts)
         fit_old = build_isdf(mol, anchor_algorithm="rbrp", **opts)
         np.testing.assert_array_equal(fit_id["anchor_indices"], fit_old["anchor_indices"])
         np.testing.assert_allclose(fit_id["interp_vecs"], fit_old["interp_vecs"], rtol=1e-9, atol=1e-9)
         np.testing.assert_allclose(fit_id["coulomb_metric"], fit_old["coulomb_metric"], rtol=1e-9, atol=1e-9)
         self.assertAlmostEqual(fit_id["pair_space_errors"]["scalar"]["relative"],
                                fit_old["pair_space_errors"]["scalar"]["relative"], places=9)
-        only = build_isdf(mol, anchor_algorithm="rbrp-id", level=0, anchor_rank=2,
+        only = build_isdf(mol, anchor_algorithm="rbrp_id", level=0, anchor_rank=2,
                           compute_metric=False, selection_only=True)
         self.assertIsNone(only["interp_vecs"])
         np.testing.assert_array_equal(only["anchor_indices"], fit_id["anchor_indices"])
@@ -104,7 +104,7 @@ class TestRBRPID(unittest.TestCase):
 
         with patch("isdf.dft.gen_grid.Grids", side_effect=make_grid):
             result = build_isdf(mol, level=0, anchor_rank=2,
-                                anchor_algorithm="rbrp-id", space="host",
+                                anchor_algorithm="rbrp_id", space="host",
                                 compute_metric=False, pair_space_error=True)
         self.assertTrue(np.all(result["anchor_weights"] < 0))
         j = result["anchor_indices"]
@@ -119,13 +119,13 @@ class TestRBRPID(unittest.TestCase):
     def test_driver_rejects_unsupported_axes(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
         with self.assertRaisesRegex(ValueError, "axes"):
-            build_isdf(mol, anchor_algorithm="rbrp-id", axes=("dx",))
+            build_isdf(mol, anchor_algorithm="rbrp_id", axes=("dx",))
 
     @unittest.skipIf(hasattr(mp_isdf, "rbrp_ao_device"), "requires CPU-only build")
     def test_device_rejected_without_cuda(self):
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", verbose=0)
         with self.assertRaisesRegex(ValueError, "requires a CUDA build"):
-            build_isdf(mol, anchor_algorithm="rbrp-id", space="device")
+            build_isdf(mol, anchor_algorithm="rbrp_id", space="device")
 
     @unittest.skipUnless(hasattr(mp_isdf, "rbrp_ao_device"), "requires CUDA build")
     def test_device_rbrp_id_and_signed_weights(self):
@@ -154,7 +154,7 @@ class TestRBRPID(unittest.TestCase):
             rel = (np.linalg.norm(exact*np.sqrt(np.abs(weights))[:, None]) /
                    np.linalg.norm(pairs*np.sqrt(np.abs(weights))[:, None]))
             self.assertAlmostEqual(rel, device["relative_residual"], places=10)
-        dev_fit = build_isdf(mol, anchor_algorithm="rbrp-id", anchor_rank=2,
+        dev_fit = build_isdf(mol, anchor_algorithm="rbrp_id", anchor_rank=2,
                              space="device", pair_space_error=True,
                              compute_metric=False)
         self.assertAlmostEqual(dev_fit["pair_space_errors"]["scalar"]["relative"],

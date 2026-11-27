@@ -4,7 +4,7 @@
 
 namespace isdf {
 
-enum class SketchPolicy { FeatureQuadrature, AOQuadrature, AODensity, AODensityNormalized };
+enum class SketchPolicy { Quadrature, AODensity, AODensityNormalized };
 
 // Shared factored Gaussian probes and QRCP. Density policies consume a complete
 // nonnegative point importance, independent of the physical quadrature weights.
