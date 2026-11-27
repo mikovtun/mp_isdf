@@ -44,14 +44,14 @@ if(ISDF_ENABLE_OPENMP)
 endif()
 
 # The large randomized sketch path needs 64-bit BLAS/LAPACK integer ABIs.
-# BLAS++ uses this cache option for its C++ wrappers; FindLAPACK uses BLA_*
-# when MAGMA and LAPACK++ locate the Fortran backend.
+# BLAS++ uses this cache option for its C++ wrappers; CMake's FindBLAS and
+# FindLAPACK use BLA_SIZEOF_INTEGER to select the same Fortran ABI. Neither
+# package is pinned to a vendor: -DBLA_VENDOR=AOCL (or another vendor) is
+# optional. A fresh build directory is recommended when changing libraries.
 set(blas_int "int64_t (ILP64)" CACHE STRING "BLAS integer size" FORCE)
+set(use_cmake_find_blas ON CACHE BOOL "Use CMake FindBLAS for ILP64 selection" FORCE)
 set(use_cmake_find_lapack ON CACHE BOOL "Use CMake FindLAPACK for ILP64 selection" FORCE)
 set(BLA_SIZEOF_INTEGER 8 CACHE STRING "Require ILP64 BLAS/LAPACK integers" FORCE)
-# Select a known ILP64 MKL interface where available instead of allowing
-# BLAS++'s generic finder to pair an integer-width-ambiguous BLAS with ILP64 LAPACK.
-set(BLA_VENDOR Intel10_64ilp_seq CACHE STRING "Select ILP64 MKL BLAS/LAPACK" FORCE)
 FetchContent_MakeAvailable(blaspp lapackpp)
 # The embedded LAPACK++ configuration can omit the Fortran symbol-mangling
 # definition when a vendor BLAS/LAPACK is found via CMake. ILP64 libraries
